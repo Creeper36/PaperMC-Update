@@ -1799,7 +1799,6 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-
     output("+==========================================================================+")
     output(r'''|     _____                              __  __          __      __        |
 |    / ___/___  ______   _____  _____   / / / /___  ____/ /___ _/ /____    |
@@ -1879,5 +1878,9 @@ if __name__ == '__main__':
 
         serv.get_new(default_version=args.version, default_build=args.build, backup=not (args.no_backup or args.new),
                     new=args.new, output_name=name, target_copy=args.copy_old)
-
         sys.exit(88)
+        
+    else:
+        
+        sys.exit(0)
+        

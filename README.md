@@ -181,11 +181,13 @@ Copies the old file to a new location before the installation process:
 Displays stats on the selected version and build:
 >-s, --stats
 
-Log-friendly filtering of output mainly used for batch files.
 >-ba, --batch
-
-NOTE: You can optionally choose to redirect output (>>) to your logs with minimal output.   
-See: [BEFORE AND AFTER EXAMPLE](https://i.ibb.co/58tbsYr/batch.jpg)   
+Log-friendly output with no downloading animation, blank lines removed,
+and filtering out some output mainly used for batch files. You can optionally
+choose to redirect output (>>) to your logs with minimal output.   
+filter.cfg in the same directory as server_update.py.. each line will contain filter definitions.
+if no filter.cfg is present it will not filter and not error.. will assume its empty.
+see: [BEFORE AND AFTER EXAMPLE](https://i.ibb.co/58tbsYr/batch.jpg)   
 
         PYTHON C:\Minecraft\Scripts\server_update.py --batch C:\Minecraft\paper.jar >> C:\Minecraft\logs\latest.log
 

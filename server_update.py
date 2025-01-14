@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import sys
+import os
+import argparse
 
 # Before we do ANYTHING, we check to make sure python is the correct version!
 
 if sys.version_info < (3,7,0):
 
     sys.stdout.write("\n--== [ Invalid python version! ] ==--\n")
-    sys.stdout.write("Current version: {}\n".format(version_info))
+    sys.stdout.write("Current version: {}\n".format(sys.version_info))
     sys.stdout.write("Expected version: 3.7+\n")
     sys.stdout.write("\nPlease install the correct version of python before continuing!\n")
 
@@ -202,26 +204,47 @@ def upgrade_script(serv: ServerUpdater):
 
     output("# Script update complete!\n")
 
-filterArray = [
-    "[PaperMC", "[Handles", "[Written", "[ --== Installation", "[ --== Paper", "# Loading build", "# Removed",
-    "[ --== Checking", "|  ", "[ --== Version", "[ --== Starting", "[ --== Download", "[ --== End", "# Done",
-    "# Selecting latest", "*****", "+====", "# Temporary", "# Saved", "# Loading version"
-]
+
+# Path to the filter configuration file
+filter_config_path = 'filter.cfg'
+
+# Declare the global filter list
+filter_list = []
+
+def load_filter_config(file_path: str) -> None:
+    """
+    Load filter items from the specified configuration file and store them globally.
+
+    :param file_path: Path to the filter configuration file
+    """
+    global filter_list
+    if not os.path.exists(file_path):
+        filter_list = []  # No filtering if file doesn't exist
+        return
+
+    try:
+        with open(file_path, 'r') as file:
+            filter_list = [line.strip() for line in file if line.strip()]
+    except Exception:
+        filter_list = []  # Fail silently
+        return
+
+
+# Initialize the filter list
+load_filter_config(filter_config_path)
 
 def output(text: str):
-
     """
     Outputs text to the terminal via print,
     will not print content if we are in quiet mode.
     """
-
     if args.quiet:
         return
 
     if args.batch:
         if not text.strip():
             return
-        for pattern in filterArray:
+        for pattern in filter_list:
             if pattern in text:
                 return
 
@@ -1776,6 +1799,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+
     output("+==========================================================================+")
     output(r'''|     _____                              __  __          __      __        |
 |    / ___/___  ______   _____  _____   / / / /___  ____/ /___ _/ /____    |
@@ -1856,8 +1880,4 @@ if __name__ == '__main__':
         serv.get_new(default_version=args.version, default_build=args.build, backup=not (args.no_backup or args.new),
                     new=args.new, output_name=name, target_copy=args.copy_old)
 
-        sys.exit(8)
-
-    else:
-
-        sys.exit(0)
+        sys.exit(88)

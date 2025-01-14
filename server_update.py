@@ -1878,7 +1878,7 @@ if __name__ == '__main__':
 
         serv.get_new(default_version=args.version, default_build=args.build, backup=not (args.no_backup or args.new),
                     new=args.new, output_name=name, target_copy=args.copy_old)
-        sys.exit(88)
+        sys.exit(8)
         
     else:
         

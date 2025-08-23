@@ -1,5 +1,17 @@
 # Changelog 
 
+## 4.0.1c
+
+ - Fixed quiet mode not working correctly
+
+ - Updated quiet mode handling to silence all output (print, stdout, stderr) when -q/--quiet is specified.
+
+ - Bound output() to parsed argparse options (args) so quiet/batch flags are automatically applied globally.
+
+ - Added Ability for output() to respect argparse options without manually passing args in every call.
+
+ - Improved Consistent handling of quiet and batch flags across the codebase.
+
 ## 4.0.0c
 
  - Strengthened error handling to exit cleanly on failure rather than leaving behind partial state.

@@ -42,7 +42,7 @@ from textwrap import dedent
 A Set of tools to automate the server update process.
 """
 
-__version__ = '4.0.1c'
+__version__ = '4.0.2c'
 
 # These variables contain links for the script updating process.
 
@@ -237,6 +237,11 @@ def upgrade_script(serv: ServerUpdater):
     :type serv: ServerUpdater
     """
     
+
+    if not args.batch:
+
+        output("\n[ --== Starting Script Upgrade: ==-- ]\n")
+
     output("# Checking for update ...")
     
     # Creating request here:
@@ -293,7 +298,13 @@ def upgrade_script(serv: ServerUpdater):
 
     # We are done!
 
-    output("# Script update complete!\n")
+    if not args.batch:
+
+        output("\n[ --== Script Upgrade Complete! ==-- ]\n")
+
+    else:
+
+        output("# Script upgrade complete!)
 
 
 def output(text: str, args=None):
@@ -1047,7 +1058,9 @@ class FileUtil:
         :type new: bool
         """
 
-        output("\n[ --== Moving Files To Target: ==-- ]\n")
+        if not args.upgrade:
+
+            output("\n[ --== Moving Files To Target: ==-- ]\n")
 
         if self.interactive:
 
@@ -1165,7 +1178,9 @@ class FileUtil:
 
         output("# Done moving download data to target location!")
 
-        output("\n[ --== Moving Files Complete! ==-- ]")
+        if not args.upgrade:
+
+            output("\n[ --== Moving Files Complete! ==-- ]")
 
         return True
 

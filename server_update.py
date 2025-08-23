@@ -42,7 +42,7 @@ from textwrap import dedent
 A Set of tools to automate the server update process.
 """
 
-__version__ = '4.0.0c'
+__version__ = '4.0.1c'
 
 # These variables contain links for the script updating process.
 
@@ -56,6 +56,25 @@ filterArray = [
     "[ --== Checking", "|  ", "[ --== Version", "[ --== Starting", "[ --== Download", "[ --== End", "# Done",
     "# Selecting latest", "*****", "+====", "# Temporary", "# Saved", "# Loading version"
 ]
+
+
+quietmode = any(flag in sys.argv for flag in ("-q", "--quiet"))
+
+if quietmode:
+
+    import builtins
+
+    builtins.print = lambda *a, **k: None
+
+    try:
+
+        sys.stdout.write = lambda *a, **k: None
+
+        sys.stderr.write = lambda *a, **k: None
+
+    except Exception:
+
+        pass
 
 
 def _is_windows():
@@ -284,33 +303,17 @@ def output(text: str, args=None):
     and will apply batch-mode filters if in batch mode.
     """
 
-    if args is None:
-
-        print(text)
-
+    if args.quiet:
         return
 
-    if getattr(args, "quiet", False):
-
-        return
-
-    if getattr(args, "batch", False):
-
+    if args.batch:
         if not text.strip():
-
             return
-
         for pattern in filterArray:
-
             if pattern in text:
-
                 return
 
-        print(text.strip())
-
-    else:
-
-        print(text)
+    print(text.strip() if args.batch else text)
 
 
 def error_report(exc, net: bool=False):
@@ -902,13 +905,12 @@ class FileUtil:
 
     def load_config(self, config: str) -> Tuple[str, int]:
         """
-        Loads configuration info from 'version.json' in the server directory
+        Loads configuration info from 'version_history.json' in the server directory
         We only load version info if it's in the official format!
 
         :param config: Path to config file
         :type config: str
-        :return: Configuration info from file
-        :rtype: Tuple[str, int]
+        :return: (version, build)
         """
 
         if config is None:
@@ -923,7 +925,7 @@ class FileUtil:
 
                 config = self.path.parent / self.config_default
 
-        output("# Loading configuration data from file [{}] ...".format(config))
+        output("# Loading data from file [{}] ...".format(config))
 
         if not Path(config).is_file():
 
@@ -953,9 +955,27 @@ class FileUtil:
 
             else:
 
-                print("# Unable to load config data from file [{}] - Not found in any parent directories!".format(config))
+                if _is_windows():
 
-                return '0', 0
+                    fallback = Path(r"C:\minecraft") / "version_history.json"
+
+                    if fallback.is_file():
+
+                        output("# Falling back to [{}] ...".format(fallback))
+
+                        config = fallback
+
+                    else:
+
+                        print("# Unable to load config data from file [{}] - Not found in any parent directories!".format(config))
+
+                        return '0', 0
+
+                else:
+
+                    print("# Unable to load config data from file [{}] - Not found in any parent directories!".format(config))
+
+                    return '0', 0
 
         # Load file content
 
@@ -1377,11 +1397,11 @@ class ServerUpdater:
         :return: True is new version, False if not/error
         """
 
-        output("[ --== Checking For New Version: ==-- ]\n")
+        output("\n[ --== Checking For New Version: ==-- ]\n")
 
         # Checking for new server version
 
-        output("Loading version information ...")
+        output("# Loading version information ...")
 
         try:
 
@@ -2047,6 +2067,16 @@ if __name__ == '__main__':
     parser.add_argument('-nr', '--no-rename', help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+
+    def _bind_output_with_args(_args):
+        global output
+        _orig_output = output
+        def _bound_output(text, args=None):
+            return _orig_output(text, _args if args is None else args)
+        output = _bound_output
+
+    _bind_output_with_args(args)
+
     
     if not (args.batch):
 

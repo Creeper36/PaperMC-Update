@@ -179,6 +179,9 @@ Specifies a custom user agent string, see below for why you should do this and w
 Checks GitHub for a new version of this script, and upgrades if necessary:
 >-u, --upgrade
 
+Force a script upgrade even if versions match (implies --upgrade):
+>-F, --force-upgrade
+
 ## User Agent
 
 According to the new [API V3 documentation](https://docs.papermc.io/misc/downloads-api),
@@ -215,6 +218,12 @@ In addition, this value will NOT change going forward (with the exception of the
 To avoid any future problems, you should, again, use a custom user agent!
 
 ## Newest Added Features/Notes
+
+- Introduced `-F/--force-upgrade` option that always downloads and reinstalls
+  the updater script, even when the local __version__ matches GitHub’s tag.
+  • Allows recovery from local script corruption.
+  • Ensures consistency when GitHub re-publishes a release under the same tag.
+  • Provides a reliable override when tag formatting differs (e.g. `v4.0.2c` vs `4.0.2c`).
 
 - New flag: `-ba / --batch`  
     - Produces log-friendly output.  [BEFORE / AFTER images](https://i.postimg.cc/wqjRkvzy/batch.jpg)

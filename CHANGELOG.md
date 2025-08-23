@@ -1,5 +1,21 @@
 # Changelog 
 
+## 4.0.3c
+
+- Bumped version from 4.0.1c to 4.0.3c
+
+- --Stats mode now resolves version/build silently without printing the “Version Selection” banner or prompts
+
+- After displaying stats, script exits immediately with code 1 instead of continuing into update checks
+
+- Added --force-upgrade  flag and improved script self-upgrade with better error handling and quiet/batch support
+
+- Added Windows fallback to C:\minecraft\version_history.json if config is missing and improved upward directory search
+
+- Standardized output headings, suppressed some banners during upgrades, and clarified network error messages
+
+- Exit code scheme preserved (0 = success, 1 = no update/stats, 2 = no internet)
+
 ## 4.0.1c
 
  - Fixed quiet mode not working correctly

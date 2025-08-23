@@ -42,7 +42,7 @@ from textwrap import dedent
 A Set of tools to automate the server update process.
 """
 
-__version__ = '4.0.2c'
+__version__ = '4.0.3c'
 
 # These variables contain links for the script updating process.
 

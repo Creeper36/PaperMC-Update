@@ -221,7 +221,7 @@ def load_config_new(config: dict) -> Tuple[str, int]:
     return version, build
 
 
-def upgrade_script(serv: ServerUpdater):
+def upgrade_script(serv: ServerUpdater, force: bool = False):
     """
     Upgrades this script.
     
@@ -236,33 +236,58 @@ def upgrade_script(serv: ServerUpdater):
     :param serv: ServerUpdater to use
     :type serv: ServerUpdater
     """
-    
 
     if not args.batch:
 
         output("\n[ --== Starting Script Upgrade: ==-- ]\n")
-
-    output("# Checking for update ...")
     
     # Creating request here:
-    
+
     req = urllib.request.Request(GITHUB_RELEASE, headers={'Accept': 'application/vnd.github.v3+json'})
 
     # Getting data:
-    
-    data = json.loads(urllib.request.urlopen(req).read())
 
-    # Checking if the version is new:
+    try:
 
-    if data['tag_name'] == __version__:
+        resp = urllib.request.urlopen(req)
 
-        # No update necessary, lets log and exit:
+        data = json.loads(resp.read())
 
-        output("# No update necessary!\n")
+    except URLError as e:
+
+        # Network / DNS / timeout / refused, etc.
+
+        error_report(e, net=True)
 
         return
 
-    output("# New version available!")
+    except JSONDecodeError as e:
+
+        # Got a response but it wasn't valid JSON
+
+        error_report(e)
+
+        return
+
+    except Exception as e:
+
+        # Any other unexpected problem
+
+        error_report(e)
+
+        return
+
+    if not force and data.get('tag_name') == __version__:
+
+        output("# No upgrade necessary!\n")
+
+        return
+
+    if force and data.get('tag_name') == __version__:
+
+        output("# Force script download")
+    else:
+        output("# New version available!")
 
     url = GITHUB_RAW
 
@@ -280,17 +305,57 @@ def upgrade_script(serv: ServerUpdater):
 
     # Getting data:
 
-    data = urllib.request.urlopen(urllib.request.Request(url))
+    if not args.batch and not args.quiet:
 
-    # Write the data:
-    
+        output("\n[ --== Starting Download: ==-- ]\n")
+
     serv.fileutil.create_temp_dir()
 
     temp_path = Path(serv.fileutil.temp.name).expanduser().resolve() / 'temp'
 
-    file = open(temp_path, mode='wb')
+    req = urllib.request.Request(url)
 
-    file.write(data.read())
+    with urllib.request.urlopen(req) as resp:
+
+        total = int(resp.info().get("Content-Length", 0))
+
+        chunk = 8192
+
+        use_progress = (not args.batch and not args.quiet and total > 0)
+
+        if use_progress:
+
+            steps = max(1, (total + chunk - 1) // chunk)
+
+        with open(temp_path, "wb") as f:
+
+            step_idx = 0
+
+            while True:
+
+                buf = resp.read(chunk)
+
+                if not buf:
+
+                    if use_progress:
+
+                        progress_bar(total, chunk, steps, steps - 1)
+
+                    break
+
+                f.write(buf)
+
+                if use_progress:
+
+                    # call progress_bar once per chunk
+
+                    progress_bar(total, chunk, steps, min(step_idx, steps - 1))
+
+                    step_idx += 1
+
+    if not args.batch and not args.quiet:
+
+        output("\n[ --== Download Complete! ==-- ]")
 
     # Move the new script:
 
@@ -300,11 +365,11 @@ def upgrade_script(serv: ServerUpdater):
 
     if not args.batch:
 
-        output("\n[ --== Script Upgrade Complete! ==-- ]\n")
+        output("\n[ --== Script Upgrade Complete! ==-- ]")
 
     else:
 
-        output("# Script upgrade complete!)
+        output("# Script upgrade complete!")
 
 
 def output(text: str, args=None):
@@ -1349,7 +1414,7 @@ class ServerUpdater:
 
         b = self.buildnum if build is None else build
 
-        output("\nServer Version Information:")
+        output("\n# Server Version Information:")
 
         output("  > Version: [{}]".format(v))
 
@@ -1363,23 +1428,54 @@ class ServerUpdater:
         We display the version, build, time,
         commit changes, filename, and the sha256 hash.
 
-        :param data: Dictionary to display
-        :type data: dict
+        Unlike version_select(), this bypasses interactive
+        prompts and the 'Version Selection' banner so that
+        --stats runs cleanly and only prints stats.
         """
 
-        # Get the version we are working with:
+        try:
 
-        ver, build = self.version_select(args.version, args.build)
+            versions = self.update.get_versions()
 
-        # Check if download is aborted:
-        
-        if ver == '' or build == -1:
+        except Exception as e:
 
-            # Error occurred, cancel stats operation
+            self._url_report("API Fetch Operation")
+
+            error_report(e, net=isinstance(e, URLError))
 
             return
 
-        # Get the data:
+        ver = self._select(args.version, versions, 'latest', 'version', print_output=False)
+
+        if not ver:
+
+            return
+
+        try:
+
+            builds = list(self.update.get_buildnums(ver))
+
+        except Exception as e:
+
+            self._url_report("API Fetch Operation")
+
+            error_report(e, net=isinstance(e, URLError))
+
+            return
+
+        if not builds:
+
+            print("# No builds available for version", ver)
+
+            return
+
+        build = self._select(args.build, builds, -1, 'buildnum', print_output=False)
+
+        if not build:
+
+            return
+
+        # Get the data
 
         data = self.update.get(ver, build)
 
@@ -1392,7 +1488,6 @@ class ServerUpdater:
         output(f"SHA256 Hash: {data['downloads']['server:default']['checksums']['sha256']}")
 
         for num, change in enumerate(data['commits']):
-
             output("\nChange {}:\n".format(num))
             output("Commit ID: {}".format(change['sha']))
             output("Commit Time: {}".format(change['time']))
@@ -2072,6 +2167,7 @@ if __name__ == '__main__':
     parser.add_argument('-V', '--script-version', help='Displays script version', version=__version__, action='version')
     parser.add_argument("-ua", "--user-agent", help="User agent to utilize when making requests this should be unique and custom to you! See https://docs.papermc.io/misc/downloads-api/", type=str, default='')
     parser.add_argument('-u', '--upgrade', help='Upgrades this script to a new version if necessary, and exits', action='store_true')
+    parser.add_argument('-F', '--force-upgrade', help='Force a script upgrade even if versions match (implies --upgrade)', action='store_true')
 
     # +===========================================+
     # Deprecated arguments - Included for compatibility, but do nothing
@@ -2116,12 +2212,16 @@ if __name__ == '__main__':
 
     # Determine if we should upgrade:
 
-    if args.upgrade:
-    
-        output("Checking for script update ...")
-    
-        upgrade_script(serv)
-        
+    if args.force_upgrade:
+
+        output("# Force upgrade enabled!")
+
+    if args.upgrade or args.force_upgrade:
+
+        output("# Checking for script upgrade ...")
+
+        upgrade_script(serv, force=args.force_upgrade)
+
         sys.exit()
 
     # Start the server updater
@@ -2159,6 +2259,8 @@ if __name__ == '__main__':
         # Display stats to the terminal:
 
         serv.view_data()
+
+        sys.exit (1)
 
     # Checking if we are skipping the update
 

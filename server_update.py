@@ -53,7 +53,7 @@ GITHUB_RAW = 'https://raw.githubusercontent.com/Creeper36/PaperMC-Update/master/
 
 filterArray = [
     "[PaperMC", "[Handles", "[Written", "[ --== Moving", "[ --== Paper", "# Loading build", "# Removed",
-    "[ --== Checking", "|  ", "[ --== Version", "[ --== Starting", "[ --== Download", "[ --== End", "# Done",
+    "[ --== Checking", "|  ", "[ --== Version", "[ --== Starting", "[ --== End", "# Done",
     "# Selecting latest", "*****", "+====", "# Temporary", "# Saved", "# Loading version"
 ]
 
@@ -309,6 +309,10 @@ def upgrade_script(serv: ServerUpdater, force: bool = False):
 
         output("\n[ --== Starting Download: ==-- ]\n")
 
+    if args.batch and not args.quiet:
+
+        output ("# Starting download...")
+
     serv.fileutil.create_temp_dir()
 
     temp_path = Path(serv.fileutil.temp.name).expanduser().resolve() / 'temp'
@@ -356,6 +360,10 @@ def upgrade_script(serv: ServerUpdater, force: bool = False):
     if not args.batch and not args.quiet:
 
         output("\n[ --== Download Complete! ==-- ]")
+
+    if args.batch and not args.quiet:
+
+        output("# Download complete!")
 
     # Move the new script:
 
@@ -1861,7 +1869,13 @@ class ServerUpdater:
 
         # Starting download process:
 
-        output("\n[ --== Starting Download: ==-- ]\n")
+        if not args.batch and not args.quiet:
+
+            output("\n[ --== Starting Download: ==-- ]\n")
+
+        if args.batch and not args.quiet:
+
+            output("# Starting download...")
 
         try:
 
@@ -1909,7 +1923,13 @@ class ServerUpdater:
 
         output("# Saved file to: {}".format(path))
 
-        output("\n[ --== Download Complete! ==-- ]")
+        if not args.batch and not args.quiet:
+
+            output("\n[ --== Download Complete! ==-- ]")
+
+        if args.batch and not args.quiet:
+
+            output("# Download complete!")
 
         # Determining output name:
 

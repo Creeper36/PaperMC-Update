@@ -1,5 +1,25 @@
 # Changelog 
 
+## 4.1.0c
+
+- Standardize exit codes (0=nothing, 1=update, 2=upgrade, 3=no internet, 10=fatal)
+
+- Exit with 10 on invalid Python version (<3.7)
+
+- Improve no-internet detection and exit with 3
+
+- Make --check-only always perform check and exit 0
+
+- Refactor upgrade path: exit 2 only on real upgrade, 0 otherwise
+
+- Update install path exits 1 when update applied, 0 when none
+
+- Replace exit()/bare sys.exit() with explicit sys.exit(0) for info paths
+
+- Fatal file-operation errors (lock/delete) exit 10
+
+- Clean banner/quiet/batch output and remove stray spacing in sys.exit() calls
+
 ## 4.0.3c
 
 - Bumped version from 4.0.1c to 4.0.3c

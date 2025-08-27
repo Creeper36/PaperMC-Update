@@ -237,17 +237,22 @@ To avoid any future problems, you should, again, use a custom user agent!
 ------------------------------------------------------------------------------------
 
 - Errorlevels introduced for batch scripting integration:  
-    - **0** → Normal exit: New Minecraft version found.  
-    - **1** → Normal exit: No new version found.  
-    - **2** → Error: No internet connection detected.  
+
+    - **0** → Normal exit: Nothing to do.  
+    - **1** → Normal exit: New paper version found.  
+    - **2** → Normal exit: New script version found.  
+    - **3** → Error: No internet connection detected.  
+    - **10** → FATAL Error: (bad python version; windows file in use / move-delete failure)
  
 ```   
     - Example batch usage:  
     PYTHON server_update.py C:\Minecraft\paper.jar
-    IF %ERRORLEVEL% EQU 2 GOTO ERRORINTERNET
-    IF %ERRORLEVEL% EQU 1 GOTO SAMEPAPER
-    IF %ERRORLEVEL% EQU 0 GOTO NEWPAPERFOUND
-    GOTO SAMEPAPER
+    IF %ERRORLEVEL% EQU 10 GOTO FATALERROR
+    IF %ERRORLEVEL% EQU 3 GOTO NOINTERNET
+    IF %ERRORLEVEL% EQU 2 GOTO NEWSCRIPTFOUND
+    IF %ERRORLEVEL% EQU 1 GOTO NEWPAPERFOUND
+    IF %ERRORLEVEL% EQU 0 GOTO NOTHINGTODO
+    GOTO NOTHINGTODO
 ```
 
 ------------------------------------------------------------------------------------

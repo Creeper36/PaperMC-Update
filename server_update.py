@@ -14,7 +14,7 @@ if sys.version_info < (3,7,0):
     sys.stdout.write("Expected version: 3.7+\n")
     sys.stdout.write("\nPlease install the correct version of python before continuing!\n")
 
-    sys.exit()
+    sys.exit(10)
 
 import tempfile
 import urllib.request
@@ -42,7 +42,7 @@ from textwrap import dedent
 A Set of tools to automate the server update process.
 """
 
-__version__ = '4.0.3c'
+__version__ = '4.1.0c'
 
 # These variables contain links for the script updating process.
 
@@ -125,13 +125,15 @@ def check_internet_connection():
 
         time.sleep(1)
 
-    print("# ERROR: No Internet Connection detected!")
+    if _is_windows():
 
-    if not _is_windows():
+        print("# ERROR: No Internet Connection detected!")
+       
+    else:
 
         print("# ERROR: No Internet Connection detected (Linux/Unix: 'ping' may be missing. Please install 'iputils-ping' or similar.)")
 
-    sys.exit(2)
+    sys.exit(3)
 
 
 def load_config_old(config: dict) -> Tuple[str, int]:
@@ -305,11 +307,11 @@ def upgrade_script(serv: ServerUpdater, force: bool = False):
 
     # Getting data:
 
-    if not args.batch and not args.quiet:
+    if not args.batch:
 
         output("\n[ --== Starting Download: ==-- ]\n")
 
-    if args.batch and not args.quiet:
+    if args.batch:
 
         output ("# Starting download...")
 
@@ -357,11 +359,11 @@ def upgrade_script(serv: ServerUpdater, force: bool = False):
 
                     step_idx += 1
 
-    if not args.batch and not args.quiet:
+    if not args.batch:
 
         output("\n[ --== Download Complete! ==-- ]")
 
-    if args.batch and not args.quiet:
+    if args.batch:
 
         output("# Download complete!")
 
@@ -379,6 +381,8 @@ def upgrade_script(serv: ServerUpdater, force: bool = False):
 
         output("# Script upgrade complete!")
 
+    sys.exit(2)
+
 
 def output(text: str, args=None):
     """
@@ -388,13 +392,19 @@ def output(text: str, args=None):
     """
 
     if args.quiet:
+
         return
 
     if args.batch:
+
         if not text.strip():
+
             return
+
         for pattern in filterArray:
+
             if pattern in text:
+
                 return
 
     print(text.strip() if args.batch else text)
@@ -1202,7 +1212,7 @@ class FileUtil:
 
                                 output("# Please close the Minecraft server (or any process using this file) and try again.")
 
-                                sys.exit(1)
+                                sys.exit(10)
 
                             else:
 
@@ -1213,7 +1223,7 @@ class FileUtil:
                             self._fail_install("Old File Deletion")
                             error_report(e)
 
-                            sys.exit(1)
+                            sys.exit(10)
 
                         output("# Removed original file!")
 
@@ -1869,11 +1879,11 @@ class ServerUpdater:
 
         # Starting download process:
 
-        if not args.batch and not args.quiet:
+        if not args.batch:
 
             output("\n[ --== Starting Download: ==-- ]\n")
 
-        if args.batch and not args.quiet:
+        if args.batch:
 
             output("# Starting download...")
 
@@ -1923,11 +1933,11 @@ class ServerUpdater:
 
         output("# Saved file to: {}".format(path))
 
-        if not args.batch and not args.quiet:
+        if not args.batch:
 
             output("\n[ --== Download Complete! ==-- ]")
 
-        if args.batch and not args.quiet:
+        if args.batch:
 
             output("# Download complete!")
 
@@ -1977,7 +1987,7 @@ class ServerUpdater:
 
         output("# Done cleaning temporary directory!")
 
-        output("\nUpdate complete!")
+        output("\n# Update complete!")
 
         # Updating values
 
@@ -2230,6 +2240,12 @@ if __name__ == '__main__':
 
     update_available = True
 
+    if args.check_only:
+
+        update_available = serv.check(args.version, args.build)
+
+        sys.exit(0)  # check-only never signals update
+
     # Determine if we should upgrade:
 
     if args.force_upgrade:
@@ -2242,7 +2258,7 @@ if __name__ == '__main__':
 
         upgrade_script(serv, force=args.force_upgrade)
 
-        sys.exit()
+        sys.exit(0)
 
     # Start the server updater
 
@@ -2270,7 +2286,7 @@ if __name__ == '__main__':
 
         # Already printed it, lets exit
 
-        exit()
+        sys.exit(0)
 
     # Check for displaying stats:
 
@@ -2280,7 +2296,7 @@ if __name__ == '__main__':
 
         serv.view_data()
 
-        sys.exit (1)
+        sys.exit(0)
 
     # Checking if we are skipping the update
 
@@ -2299,9 +2315,9 @@ if __name__ == '__main__':
         serv.get_new(default_version=args.version, default_build=args.build, backup=not (args.no_backup or args.new),
                     new=args.new, output_name=name, target_copy=args.copy_old)
 
-        sys.exit(0)
+        sys.exit(1)
 
     else:
 
-        sys.exit(1)
+        sys.exit(0)
 

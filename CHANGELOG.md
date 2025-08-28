@@ -1,5 +1,9 @@
 # Changelog 
 
+## 4.1.1c
+
+- Added --check-only local and remote menu based off interactive style
+
 ## 4.1.0c
 
 - Standardize exit codes (0=nothing, 1=update, 2=upgrade, 3=no internet, 10=fatal)

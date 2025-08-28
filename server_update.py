@@ -42,7 +42,7 @@ from textwrap import dedent
 A Set of tools to automate the server update process.
 """
 
-__version__ = '4.1.0c'
+__version__ = '4.1.1c'
 
 # These variables contain links for the script updating process.
 
@@ -134,6 +134,25 @@ def check_internet_connection():
         print("# ERROR: No Internet Connection detected (Linux/Unix: 'ping' may be missing. Please install 'iputils-ping' or similar.)")
 
     sys.exit(3)
+
+
+def load_local_version(serv: ServerUpdater) -> tuple[str, int]:
+    """
+    Loads local version/build from version_history.json via FileUtil.
+    Returns (version, build).
+    """
+
+    try:
+
+        version, build = serv.fileutil.load_config(serv.config_file)
+
+        return version, build
+
+    except Exception as e:
+
+        output(f"# ERROR loading local version info: {e}")
+
+        return ("unknown", -1)
 
 
 def load_config_old(config: dict) -> Tuple[str, int]:
@@ -2240,11 +2259,62 @@ if __name__ == '__main__':
 
     update_available = True
 
-    if args.check_only:
+if args.check_only:
 
-        update_available = serv.check(args.version, args.build)
+    output("\n[ --== Checking For New Version: ==-- ]\n")
 
-        sys.exit(0)  # check-only never signals update
+    # Load version info using same logic as interactive
+
+    local_version, local_build = serv.fileutil.load_config(serv.config_file)
+
+    # Show Local version info (stats-style block)
+
+    output("\n+==========================================================================+")
+    output("# Local Server Version Information:")
+    output(f"  > Version: [{local_version}]")
+    output(f"  > Build:   [{local_build}]")
+    output("+==========================================================================+")
+
+    # Compare with remote builds
+
+    try:
+
+        remote_builds = serv.update.get_buildnums(local_version)
+
+    except Exception as e:
+
+        error_report(e, net=isinstance(e, URLError))
+
+        sys.exit(0)
+
+    if not remote_builds:
+
+        output(f"# ERROR: No builds found for version {local_version}")
+
+        sys.exit(0)
+
+    latest_remote_build = max(remote_builds)
+
+    # Show Remote version info (stats-style block)
+
+    output("\n+==========================================================================+")
+    output("# Remote Server Version Information:")
+    output(f"  > Version: [{local_version}]")
+    output(f"  > Build:   [{latest_remote_build}]")
+    output("+==========================================================================+\n")
+
+    if local_build >= latest_remote_build:
+
+        output("# You are up to date!")
+
+    else:
+
+        output(f"# New Version available! - [Version: {local_version}.{latest_remote_build}]")
+
+    output("\n[ --== Version check complete! ==-- ]\n")
+
+    sys.exit(0)
+
 
     # Determine if we should upgrade:
 

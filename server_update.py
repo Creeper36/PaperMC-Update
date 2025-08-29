@@ -438,14 +438,14 @@ def error_report(exc, net: bool=False):
     :type net: bool
     """
 
-    print("+==================================================+")
+    print("+=================================================+")
     print("  [ --== The Following Error Has Occurred: ==-- ]")
-    print("+==================================================+")
+    print("+=================================================+")
 
     # Print error name
 
     print("Error Name: {}".format(exc))
-    print("+==================================================+")
+    print("+=================================================+")
 
     # Print full traceback:
 
@@ -456,7 +456,7 @@ def error_report(exc, net: bool=False):
 
         # Include extra network information
 
-        print("+==================================================+")
+        print("+=================================================+")
         print("Extra Network Information:")
 
 
@@ -474,7 +474,7 @@ def error_report(exc, net: bool=False):
             print("The server could not fulfill the request.")
             print("Error code: {}".format(exc.code))
 
-    print("+==================================================+")
+    print("+=================================================+")
     print("(Can you make anything of this?)")
     print("Please check the github page for more info: https://github.com/Creeper36/PaperMC-Update.")
 
@@ -1292,7 +1292,7 @@ class FileUtil:
         Attempts to recover the backup of the old server jar file.
         """
 
-        print("+==================================================+")
+        print("+=================================================+")
         print("\n> !ATTENTION! <")
         print("A failure has occurred during the downloading process.")
         print("I'm sure you can see the error information above.")
@@ -1359,7 +1359,7 @@ class FileUtil:
         :param point: Point of failure
         """
 
-        print("\n+==================================================+")
+        print("\n+=================================================+")
         print("> !ATTENTION! <")
         print("An error occurred during the download, and we can not continue.")
         print("We will attempt to recover your previous file (If applicable)")
@@ -1516,7 +1516,7 @@ class ServerUpdater:
 
         data = self.update.get(ver, build)
 
-        output("\n+==================================================+")
+        output("\n+=================================================+")
         output("\n[ --== Paper Stats: ==-- ]\n")
         output(f"Version: {ver}")
         output(f"Build Number: {build}")
@@ -1531,7 +1531,7 @@ class ServerUpdater:
             output("Commit Message: {}".format(change['message']))
 
         output("\n[ --== End Paper Stats! ==-- ]\n")
-        output("+==================================================+\n")
+        output("+=================================================+\n")
 
     def check(self, default_version: str, default_build: int):
         """
@@ -1922,7 +1922,7 @@ class ServerUpdater:
 
         except ValueError as e:
 
-            print("\n+==================================================+")
+            print("\n+=================================================+")
             print("> !ATTENTION! <")
             print("The file integrity check failed!")
             print("This means that the file downloaded is corrupted or damaged in some way.")
@@ -2163,7 +2163,7 @@ class ServerUpdater:
         :type point: str
         """
 
-        print("\n+==================================================+")
+        print("\n+=================================================+")
         print("> !ATTENTION! >")
         print("An error occurred during a request operation.")
         print("Fail Point: {}".format(point))
@@ -2269,11 +2269,11 @@ if args.check_only:
 
     # Show Local version info (stats-style block)
 
-    output("\n+==========================================================================+")
+    output("\n+=================================================+")
     output("# Local Server Version Information:")
     output(f"  > Version: [{local_version}]")
     output(f"  > Build:   [{local_build}]")
-    output("+==========================================================================+")
+    output("+=================================================+")
 
     # Compare with remote builds
 
@@ -2297,11 +2297,11 @@ if args.check_only:
 
     # Show Remote version info (stats-style block)
 
-    output("\n+==========================================================================+")
+    output("\n+=================================================+")
     output("# Remote Server Version Information:")
     output(f"  > Version: [{local_version}]")
     output(f"  > Build:   [{latest_remote_build}]")
-    output("+==========================================================================+\n")
+    output("+=================================================+\n")
 
     if local_build >= latest_remote_build:
 

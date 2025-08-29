@@ -2315,79 +2315,78 @@ if args.check_only:
 
     sys.exit(0)
 
+# Determine if we should upgrade:
 
-    # Determine if we should upgrade:
+if args.force_upgrade:
 
-    if args.force_upgrade:
+    output("# Force upgrade enabled!")
 
-        output("# Force upgrade enabled!")
+if args.upgrade or args.force_upgrade:
 
-    if args.upgrade or args.force_upgrade:
+    output("# Checking for script upgrade ...")
 
-        output("# Checking for script upgrade ...")
+    upgrade_script(serv, force=args.force_upgrade)
 
-        upgrade_script(serv, force=args.force_upgrade)
+    sys.exit(0)
 
-        sys.exit(0)
+# Start the server updater
 
-    # Start the server updater
+serv.start()
 
-    serv.start()
+# Figure out the output name:
 
-    # Figure out the output name:
+name = None
 
-    name = None
+if args.output:
 
-    if args.output:
+    # Name was explicitly given to us:
 
-        # Name was explicitly given to us:
+    name = args.output
 
-        name = args.output
+elif args.path.is_file():
 
-    elif args.path.is_file():
+    # Get filename from the given path:
 
-        # Get filename from the given path:
+    name = args.path.name
 
-        name = args.path.name
+# Check if we are just looking for server info:
 
-    # Check if we are just looking for server info:
+if args.server_version:
 
-    if args.server_version:
+    # Already printed it, lets exit
 
-        # Already printed it, lets exit
+    sys.exit(0)
 
-        sys.exit(0)
+# Check for displaying stats:
 
-    # Check for displaying stats:
+if args.stats:
 
-    if args.stats:
+    # Display stats to the terminal:
 
-        # Display stats to the terminal:
+    serv.view_data()
 
-        serv.view_data()
+    sys.exit(0)
 
-        sys.exit(0)
+# Checking if we are skipping the update
 
-    # Checking if we are skipping the update
+if not args.no_check and not args.new and not args.interactive:
 
-    if not args.no_check and not args.new and not args.interactive:
+    # Allowed to check for update:
 
-        # Allowed to check for update:
+    update_available = serv.check(args.version, args.build)
 
-        update_available = serv.check(args.version, args.build)
+# Checking if we can download:
 
-    # Checking if we can download:
+if not args.check_only and update_available:
 
-    if not args.check_only and update_available:
+    # Allowed to download/Can download
 
-        # Allowed to download/Can download
+    serv.get_new(default_version=args.version, default_build=args.build, backup=not (args.no_backup or args.new),
+                new=args.new, output_name=name, target_copy=args.copy_old)
 
-        serv.get_new(default_version=args.version, default_build=args.build, backup=not (args.no_backup or args.new),
-                    new=args.new, output_name=name, target_copy=args.copy_old)
+    sys.exit(1)
 
-        sys.exit(1)
+else:
 
-    else:
-
-        sys.exit(0)
+    sys.exit(0)
 

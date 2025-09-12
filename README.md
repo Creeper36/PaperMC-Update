@@ -1,4 +1,78 @@
 
+## Newest Added Features/Notes
+
+- Introduced `-F/--force-upgrade` option that always downloads and reinstalls
+  the updater script, even when the local __version__ matches GitHub’s tag.
+  • Allows recovery from local script corruption.
+  • Ensures consistency when GitHub re-publishes a release under the same tag.
+  • Provides a reliable override when tag formatting differs (e.g. `v4.0.2c` vs `4.0.2c`).
+
+- New flag: `-ba / --batch`  
+    - Produces log-friendly output.  [BEFORE / AFTER images](https://i.postimg.cc/wqjRkvzy/batch.jpg)
+    - Disables download animations and extra blank lines.  
+    - Filters out cosmetic messages intended only for interactive use.  
+    - Suitable for redirecting (`>>`) into logs.  
+
+    - Example:  
+        `python C:\Minecraft\Scripts\server_updater.py --batch C:\Minecraft\paper.jar >> C:\Minecraft\logs\latest.log`  
+
+------------------------------------------------------------------------------------
+
+```  
+- Errorlevels introduced for batch scripting integration:  
+
+  Code   Name               Type          Meaning
+  -----  -------------      -----------   ---------------------------------------------
+    0    EXIT_NOTHING       Normal exit   Success: Nothing to do (already up-to-date)
+    1    EXIT_UPDATE        Normal exit   Success: New Paper version installed
+    2    EXIT_UPGRADE       Normal exit   Success: Script self-upgrade installed
+
+   10    EXIT_BAD_PY        Fatal error   Invalid Python version (<3.7)
+   11    EXIT_FILE_LOCK     Fatal error   Target file locked/in use, cannot replace
+   12    EXIT_PERM          Fatal error   Permission denied (write/replace blocked)
+   13    EXIT_NOSPACE       Fatal error   Insufficient disk space during install
+   14    EXIT_BAD_PATH      Fatal error   Invalid path or directory (missing/invalid FS)
+   15    EXIT_BAD_ROOT      Fatal error   Root directory installs are not allowed
+   16    EXIT_INTEGRITY     Fatal error   Integrity check failed (SHA256 mismatch)
+   17    EXIT_NET_DL        Fatal error   Network download error (HTTP/URL failure)
+   18    EXIT_ATOMIC        Fatal error   Atomic replace failed (unexpected OS error)
+   19    EXIT_NET_TIMEOUT   Fatal error   TCP connect timed out (no reply from host)
+   20    EXIT_NET_REFUSED   Fatal error   TCP connection refused (port closed)
+   21    EXIT_NET_UNREACH   Fatal error   Network unreachable (local routing problem)
+   22    EXIT_NET_URL       Fatal error   Malformed or invalid URL (typo, bad scheme, or DNS failure)
+   23    EXIT_NET_SSL       Fatal error   SSL handshake or cert error (invalid or untrusted cert)
+   24    EXIT_NET_OFFLINE   Fatal error   Generic offline fallback (all network tests failed)
+
+```  
+
+```   
+    - Example batch usage:  
+    PYTHON server_update.py C:\Minecraft\paper.jar
+    IF %ERRORLEVEL% EQU 2 GOTO NEWSCRIPTFOUND
+    IF %ERRORLEVEL% EQU 1 GOTO NEWPAPERFOUND
+    IF %ERRORLEVEL% EQU 0 GOTO NOTHINGTODO
+    GOTO NOTHINGTODO
+```
+
+------------------------------------------------------------------------------------
+
+- Disabled `--no-config` and `--config-file` when in interactive mode (not relevant).  
+- Interactive Mode File Handling Rules:  
+      Example:  
+        `python c:\minecraft\server_update.py --interactive c:\minecraft\paper.jar`
+
+    ```
+      Scenario                                              Result
+      --------                                              ------
+    --interactive with no last argument                  Creates paper-[version]-[build].jar in server_updater.py script directory
+    --interactive c:\minecraft       (directory path)    Creates paper-[version]-[build].jar inside c:\minecraft
+    --interactive c:\minecraft\paper.jar   (new file)    Creates a new c:\minecraft\paper.jar
+    --interactive c:\minecraft\paper.jar (not in use)    Overwrites the existing c:\minecraft\paper.jar
+    --interactive c:\minecraft\paper.jar     (in use)    Attempt delete → fails → prints ERROR and exits script. If Linux/Unix: will overwrite and stage till reboot
+    ```
+
+------------------------------------------------------------------------------------
+
 # PaperMC-Update
 
 A simple CLI script that can check, download, and install PaperMC jar files.
@@ -21,19 +95,6 @@ although we recommend you add python to your PATH environment variable, as this 
 
 More information on installing/configuring python can be found [here](https://www.python.org/downloads/)
 (Any python 3.7+ version works, although I recommend the latest version).
-
-We also supply windows binaries that can be ran directly on windows systems without python!
-We use [PyInstaller](https://www.pyinstaller.org/) to build these binaries, and they are built using the one file option, or '-F'.
-
-These binaries are much slower than running via python, and there might be some weird bugs or quirks.
-They are built for windows only. We provide one with each version change.
-
-Sometimes, these binaries are flagged as malicious programs(usually some form of trojan)
-bu numerous antivirus engines, sometimes including windows defender.
-This is unfortunately quite common for freezed python binaries.
-The best way to deal with the issue is to whitelist the executable in your antivirus. 
-
-Find them [in the releases](https://github.com/Owen-Cochell/PaperMC-Update/releases)!
 
 ## MacOS
 
@@ -207,7 +268,7 @@ It is optional, but **HIGHLY** recommended to set this value to something custom
 If a custom user agent is not provided, then this script will use the default value:
 
 ```
-PaperMC-Update/VERSION (https://github.com/OwenCochell/PaperMC-Update)
+PaperMC-Update/VERSION (https://github.com/Creeper36/PaperMC-Update)
 ```
 
 (Where `VERSION` is the current version of this script)
@@ -216,60 +277,6 @@ This default value may be blocked at any time at the discretion of the PaperMC t
 Which means, if you do not specify a custom user agent, then this script may stop working!
 In addition, this value will NOT change going forward (with the exception of the `VERSION` component).
 To avoid any future problems, you should, again, use a custom user agent!
-
-## Newest Added Features/Notes
-
-- Introduced `-F/--force-upgrade` option that always downloads and reinstalls
-  the updater script, even when the local __version__ matches GitHub’s tag.
-  • Allows recovery from local script corruption.
-  • Ensures consistency when GitHub re-publishes a release under the same tag.
-  • Provides a reliable override when tag formatting differs (e.g. `v4.0.2c` vs `4.0.2c`).
-
-- New flag: `-ba / --batch`  
-    - Produces log-friendly output.  [BEFORE / AFTER images](https://i.postimg.cc/wqjRkvzy/batch.jpg)
-    - Disables download animations and extra blank lines.  
-    - Filters out cosmetic messages intended only for interactive use.  
-    - Suitable for redirecting (`>>`) into logs.  
-
-    - Example:  
-        `python C:\Minecraft\Scripts\server_updater.py --batch C:\Minecraft\paper.jar >> C:\Minecraft\logs\latest.log`  
-
-------------------------------------------------------------------------------------
-
-- Errorlevels introduced for batch scripting integration:  
-
-    - **0** → Normal exit: Nothing to do.  
-    - **1** → Normal exit: New paper version found.  
-    - **2** → Normal exit: New script version found.  
-    - **3** → Error: No internet connection detected.  
-    - **10** → FATAL Error: (bad python version; windows file in use / move-delete failure)
- 
-```   
-    - Example batch usage:  
-    PYTHON server_update.py C:\Minecraft\paper.jar
-    IF %ERRORLEVEL% EQU 10 GOTO FATALERROR
-    IF %ERRORLEVEL% EQU 3 GOTO NOINTERNET
-    IF %ERRORLEVEL% EQU 2 GOTO NEWSCRIPTFOUND
-    IF %ERRORLEVEL% EQU 1 GOTO NEWPAPERFOUND
-    IF %ERRORLEVEL% EQU 0 GOTO NOTHINGTODO
-    GOTO NOTHINGTODO
-```
-
-------------------------------------------------------------------------------------
-- Disabled `--no-config` and `--config-file` when in interactive mode (not relevant).  
-- Interactive Mode File Handling Rules:  
-      Example:  
-        `python c:\minecraft\server_update.py --interactive c:\minecraft\paper.jar`
-
-    ```
-      Scenario                                              Result
-      --------                                              ------
-    --interactive with no last argument                  Creates paper-[version]-[build].jar in server_updater.py script directory
-    --interactive c:\minecraft       (directory path)    Creates paper-[version]-[build].jar inside c:\minecraft
-    --interactive c:\minecraft\paper.jar   (new file)    Creates a new c:\minecraft\paper.jar
-    --interactive c:\minecraft\paper.jar (not in use)    Overwrites the existing c:\minecraft\paper.jar
-    --interactive c:\minecraft\paper.jar     (in use)    Attempt delete → fails → prints ERROR and exits script. If Linux/Unix: will overwrite and stage till reboot
-    ```
 
 ## Special Keywords
 

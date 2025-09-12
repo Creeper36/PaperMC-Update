@@ -1,5 +1,79 @@
 # Changelog 
 
+## 4.2.0c
+
+- Introduced centralized EXIT_* system, covering all normal, error, and fatal exit codes (0–24).
+ 
+- Added -F/--force-upgrade flag to retrieve server_update.py even when version tags match.
+ 
+- Rebuilt self-upgrade logic to distinguish “no upgrade” vs “forced upgrade” outcomes.
+ 
+- Enforced SHA256 verification for script self-upgrade, pulling official hashes from GitHub.
+ 
+- Abort on checksum mismatch with EXIT_INTEGRITY, ensuring tamper-proof self-updates.
+ 
+- Fatal() routine standardized, replacing ad-hoc print exits with structured error reports.
+ 
+- Fatal output expanded to include target paths and raw OS errno codes for deep debugging.
+ 
+- New interactive mode enforcement: disabled --no-config and --config-file when interactive.
+ 
+- Interactive mode documented with explicit file/folder rules across Windows and Unix.
+ 
+- Windows interactive mode now fails cleanly on locked JARs with EXIT_FILE_LOCKED.
+ 
+- Linux/Unix interactive mode allows overwrite with staged completion after reboot.
+ 
+- Backup/rollback system enhanced with tracked state and safer recovery on failed installs.
+ 
+- Improved messaging when restoring from backup after unsuccessful replacement.
+ 
+- Config parser supports both legacy (git-Paper) and modern (MC-ver-build) schemas.
+ 
+- Config parsing failures now fatal, with explicit hints to rerun using --no-check if needed.
+ 
+- Path validation hardened with early fatal detection for bad or nonexistent directories.
+ 
+- Root directory installs explicitly blocked with EXIT_BAD_ROOT for safety.
+ 
+- Default auto-naming creates paper-[version]-[build].jar when only a folder is given.
+ 
+- Explicit JAR paths accepted and created automatically if nonexistent.
+ 
+- -o flag supports fully custom output names, including non-.jar extensions.
+ 
+- Escape paths via -o permitted for advanced redirection outside server root.
+ 
+- Check_internet_connection() rewritten with layered probes: TCP, ICMP, HTTP.
+ 
+- Parallelized network probes using ThreadPoolExecutor for faster connectivity checks.
+ 
+- Network failures mapped to specific exit codes (TIMEOUT, REFUSED, UNREACH, SSL, OFFLINE).
+ 
+- Update class now dual-sources metadata via v3 API primary with v2 fallback.
+ 
+- Added fetch_raw_api() to seamlessly switch APIs with clear user feedback.
+ 
+- Decode_json_metadata() introduced with URL-keyed caching to reduce HTTP churn.
+ 
+- Version_convert() strengthened with regex parsing to normalize rc/pre/+meta tags.
+ 
+- Build metadata logic falls back to “application” artifact when “server:default” missing.
+ 
+- Download loop rewritten with streaming reads + enforced SHA256 file verification.
+ 
+- Progress bar unified with new “# Downloading:” prefix for consistent output.
+ 
+- Human_readable_size() utility added for clean disk usage and space diagnostics.
+ 
+- FileUtil extended with atomic replace semantics and backup path awareness.
+ 
+- Banners, notices, and fatal messages standardized for consistent user-facing output.
+ 
+- Error_report simplified to emit raw tracebacks only, aiding developers in debug mode.
+ 
+- Expanded documentation and docstrings for clarity, portability, and forward-compatibility.
+
 ## 4.1.1c
 
 - Added --check-only local and remote menu based off interactive style

@@ -1,64 +1,114 @@
 #!/usr/bin/env python3
-# (Shebang for Linux/macOS; ignored on Windows as # comment)
 
 from __future__ import annotations
-
-import sys
-
-# Before we do ANYTHING, we check to make sure python is the correct version!
-
-if sys.version_info < (3,7,0):
-
-    sys.stdout.write("\n--== [ Invalid python version! ] ==--\n")
-    sys.stdout.write("Current version: {}\n".format(sys.version_info))
-    sys.stdout.write("Expected version: 3.7+\n")
-    sys.stdout.write("\nPlease install the correct version of python before continuing!\n")
-
-    sys.exit(10)
-
-import tempfile
+import sys, os, re, ssl, time, json, shutil, errno, socket
+import platform, subprocess, tempfile, traceback, argparse
 import urllib.request
-import shutil
-import json
-import traceback
-import argparse
-import os
-import subprocess
-import platform
-import time
-import socket
-
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 from http.client import HTTPResponse
 from hashlib import sha256
-from typing import Any, Callable, List, Sequence, Tuple, Union
-from json.decoder import JSONDecodeError
-from math import ceil
+from typing import Any, Callable, List, Sequence, Tuple, NoReturn, Union, Optional, Dict, IO
+from json import JSONDecodeError
 from pathlib import Path
 from textwrap import dedent
-
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 """
 A Set of tools to automate the server update process.
 """
 
-__version__ = '4.1.1c'
+__version__ = '4.2.0c'
 
-# These variables contain links for the script updating process.
 
 GITHUB = 'https://github.com/Creeper36/PaperMC-Update'
 GITHUB_RELEASE = 'https://api.github.com/repos/Creeper36/PaperMC-Update/releases/latest'
 GITHUB_RAW = 'https://raw.githubusercontent.com/Creeper36/PaperMC-Update/master/server_update.py'
 
 
+# === Exit codes (centralized) ===
+EXIT_NOTHING     = 0       # Success: nothing to do (already up-to-date)
+EXIT_UPDATE      = 1       # Success: Paper update installed
+EXIT_UPGRADE     = 2       # Success: Script self-upgrade installed
+EXIT_BAD_PY      = 10      # Fatal: Invalid Python version (<3.7)
+EXIT_FILE_LOCKED = 11      # Fatal: Target file locked/in use, cannot replace
+EXIT_PERM        = 12      # Fatal: Permission denied (write/replace blocked)
+EXIT_NOSPACE     = 13      # Fatal: Insufficient disk space during install
+EXIT_BAD_PATH    = 14      # Fatal: Invalid path or directory (missing/invalid)
+EXIT_BAD_ROOT    = 15      # Fatal: Root directory installs are not allowed
+EXIT_INTEGRITY   = 16      # Fatal: Integrity check failed (SHA256 mismatch)
+EXIT_NET_DL      = 17      # Fatal: Network download error (HTTP/URL failure)
+EXIT_ATOMIC      = 18      # Fatal: Atomic replace failed (unexpected OS error)
+EXIT_NET_TIMEOUT = 19      # Fatal: TCP connect timed out (no reply from host)
+EXIT_NET_REFUSED = 20      # Fatal: TCP connection refused (port closed)
+EXIT_NET_UNREACH = 21      # Fatal: Network unreachable (local routing problem)
+EXIT_NET_URL     = 22      # Fatal: Malformed or invalid URL
+EXIT_NET_SSL     = 23      # Fatal: SSL handshake or certificate error
+EXIT_NET_OFFLINE = 24      # Generic offline fallback (all network tests failed)
+
+
+def fatal(code: int, message: str = "", target: str = None, os_error: int = None) -> NoReturn:
+    """
+    Emit a standardized fatal error report and terminate immediately.
+    Captures exit code, human-readable context, and optional target path.
+    Includes raw OS errno details when provided for deep troubleshooting.
+    Guarantees clean process exit with the proper EXIT_* code.
+    """
+    output("\nx=======================================================================================x\n")
+    output("             [ !! FATAL ERROR OCCURRED !! ]")
+    output("\nx=======================================================================================x\n")
+    if message:
+        output(f"     Reason    : {message}")
+    output("\nx----------------- ERROR CODE DETAILS --------------------------------------------------x\n")
+    if code == EXIT_BAD_PY:
+        output(f"  - Target     (current) : {sys.version_info.major}.{sys.version_info.minor}")
+        output("  - Expected             : 3.7+")
+    else:
+        if target:
+            output(f"  - Target / Information  : {target}")
+        if os_error is not None:
+            output(f"  - Python OS Error Code : {os_error}")
+    output(f"")
+    output(f"  - Script Exit Code      : {code}")
+    output("\nx=======================================================================================x\n")
+    sys.exit(code)
+
+def error_report(exc, net: bool = False):
+    """
+    Print raw traceback only. Provides developers with the exact Python error flow.
+    """
+    if args.quiet:
+        return
+    traceback.print_exc()
+    return
+
+
+if sys.version_info < (3, 7, 0):
+    fatal(
+        EXIT_BAD_PY,
+        f"Invalid Python version detected (current: {sys.version_info.major}.{sys.version_info.minor}).\n\n"
+        "     Info      : This updater requires Python 3.7 or newer for compatibility.\n"
+        "     Info      : Older Python versions lack required libraries and features.\n"
+        "     Fix       : Install Python 3.7+ from https://www.python.org/downloads/.\n"
+        "     Fix       : Re-run this updater with the correct interpreter.",
+        target=f"(current) : {sys.version_info.major}.{sys.version_info.minor}", os_error=None
+    )
+
+
 filterArray = [
-    "[PaperMC", "[Handles", "[Written", "[ --== Moving", "[ --== Paper", "# Loading build", "# Removed",
-    "[ --== Checking", "|  ", "[ --== Version", "[ --== Starting", "[ --== End", "# Done",
-    "# Selecting latest", "*****", "+====", "# Temporary", "# Saved", "# Loading version"
+    "[PaperMC", "[ --== Moving", "[ --== Paper", "# Loading build", "# Removed", "# Done",
+    "[ --== Checking", "|  ", "[ --== Version", "[ --== Starting", "# Loading version",
+    "# Selecting latest", "*****", "+====", "# Temporary", "# Saved"
 ]
 
 
+
 quietmode = any(flag in sys.argv for flag in ("-q", "--quiet"))
+"""
+Enable global quiet mode if -q/--quiet is present in sys.argv.
+Overrides builtins.print and stream writes to suppress all output.
+Ensures completely silent operation, including errors and fatals.
+Intended for automation where only exit codes are consumed.
+"""
 
 if quietmode:
 
@@ -77,69 +127,292 @@ if quietmode:
         pass
 
 
+def _errno(e) -> int:
+    """
+    Safely extract an errno from Python exceptions or wrapped objects.
+    Handles OSError, socket errors, and other platforms consistently.
+    Returns -1 if no reliable errno can be deduced.
+    Ensures downstream error handlers always have a numeric code.
+    """
+
+    return getattr(e, "errno", -1)
+
+
+def _is_enospace(e) -> bool:
+    """
+    Check if the given exception represents ENOSPC (disk full).
+    Works across Python’s different exception classes and OSes.
+    Used to distinguish space exhaustion from generic I/O failure.
+    Enables targeted EXIT_NOSPACE termination when needed.
+    """
+
+    return _errno(e) == errno.ENOSPC
+
+
 def _is_windows():
+    """
+    Return True if this process is running on a Windows platform.
+    Used to branch file move/rename behavior and ping flags.
+    Ensures portability between Windows and POSIX environments.
+    A single source of truth for platform-specific logic.
+    """
 
     return platform.system().lower() == "windows"
 
 
 def check_internet_connection():
     """
-    Attempts up to 4 pings to 8.8.8.8.
-    If any ping succeeds, the function continues on the script.
-    If all 4 fail, prints an error and exits with status code 2.
-    On Linux/Unix: 'ping' command may be missing. if ping fails, it will attempt
-    a fallback socket test. if still fails, will error message and exit.
+    Perform layered connectivity tests: DNS TCP, ICMP ping, and HTTP HEAD.
+    Each failure maps to a unique EXIT_* code for diagnostics.
+    Succeeds if any probe reaches the Internet within defined timeouts.
+    Provides robust classification of offline and transient conditions.
     """
 
-    for attempt in range(4):
+    _EXIT_TIMEOUT  = globals().get("EXIT_NET_TIMEOUT", EXIT_NET_OFFLINE)
+
+    _EXIT_REFUSED  = globals().get("EXIT_NET_REFUSED", EXIT_NET_OFFLINE)
+
+    _EXIT_UNREACH  = globals().get("EXIT_NET_UNREACH", EXIT_NET_OFFLINE)
+
+
+    def _tcp_probe(host: str, port: int, timeout: float = 2.0):
+        """
+        Attempt a TCP socket connection to the given host/port.
+        Returns True on success, False on timeout or error.
+        Used as a low-level connectivity check for DNS/Internet reachability.
+        """
+
+        try:
+
+            with socket.create_connection((host, port), timeout=timeout):
+
+                return True, None
+
+        except socket.timeout:
+
+            return False, "timeout"
+
+        except OSError as e:
+
+            if getattr(e, "errno", None) == errno.ECONNREFUSED:
+
+                return False, "refused"
+
+            if getattr(e, "errno", None) in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+
+                return False, "unreach"
+
+            return False, "other"
+
+
+    def _ping_probe(host: str, timeout_s: float = 2.0) -> bool:
+        """
+        Run a system-level ping to the given host with a timeout.
+        Normalizes exit codes across platforms into a boolean result.
+        Returns True if the host replies, False otherwise.
+        """
 
         try:
 
             if _is_windows():
 
-                cmd = ["ping", "-n", "1", "8.8.8.8"]
+                ms = max(1, int(timeout_s * 1000))
+
+                cmd = ["ping", "-n", "1", "-w", str(ms), host]
 
             else:
 
-                cmd = ["ping", "-c", "1", "8.8.8.8"]
+                cmd = ["ping", "-c", "1", "-W", str(int(timeout_s)), host]
 
-            rc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+            return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
-            if rc == 0:
+        except Exception:
 
-                return  # success
-
-        except FileNotFoundError:
-
-            # Fallback: socket test if ping command not found
-
-            try:
-
-                with socket.create_connection(("8.8.8.8", 53), timeout=3):
-
-                    return
-
-            except OSError:
-
-                pass
-
-        time.sleep(1)
-
-    if _is_windows():
-
-        print("# ERROR: No Internet Connection detected!")
-       
-    else:
-
-        print("# ERROR: No Internet Connection detected (Linux/Unix: 'ping' may be missing. Please install 'iputils-ping' or similar.)")
-
-    sys.exit(3)
+            return False
 
 
-def load_local_version(serv: ServerUpdater) -> tuple[str, int]:
+    def _http_head(url: str, timeout: float = 2.0) -> bool:
+        """
+        Issue a lightweight HTTP HEAD request to the given URL.
+        Confirms both network reachability and HTTP server presence.
+        Returns True for status <400, False on error or timeout.
+        """
+
+        try:
+
+            req = urllib.request.Request(url, method="HEAD")
+
+            with urllib.request.urlopen(req, timeout=timeout):
+
+                return True
+
+        except Exception:
+
+            return False
+
+
+    def _any_success_bool(tasks):
+        """
+        Run multiple probe callables and return True if any succeed.
+        Short-circuits at the first True result to save time.
+        Provides a generic helper for multi-wave connectivity tests.
+        """
+
+        if not tasks:
+
+            return False
+
+        with ThreadPoolExecutor(max_workers=len(tasks)) as ex:
+
+            futures = [ex.submit(fn) for fn in tasks]
+
+            while futures:
+
+                done, pending = wait(futures, return_when=FIRST_COMPLETED)
+
+                for d in done:
+
+                    try:
+
+                        if d.result():
+
+                            for p in pending: p.cancel()
+
+                            return True
+
+                    except Exception:
+
+                        pass
+
+                futures = list(pending)
+
+        return False
+
+            # ---------- Wave 1: TCP (fastest) ----------
+
+    tcp_targets = [("1.1.1.1", 53), ("8.8.8.8", 53), ("9.9.9.9", 53)]
+
+    tcp_errors_seen = set()
+
+
+    def _tcp_task(h, p):
+        """
+        Run a single TCP probe against host/port.
+        Records the specific error kind in tcp_errors_seen if it fails.
+        Returns True if the connection succeeded, False otherwise.
+        Acts as a thin wrapper around _tcp_probe for error tracking.
+        """
+
+        ok, kind = _tcp_probe(h, p, timeout=2.0)
+
+        if not ok and kind:
+
+            tcp_errors_seen.add(kind)
+
+        return ok
+
+    if _any_success_bool([lambda h=h, p=p: _tcp_task(h, p) for (h, p) in tcp_targets]):
+
+        return  # online
+
+            # ---------- Wave 2: ICMP ping ----------
+
+    ping_hosts = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
+
+    if _any_success_bool([lambda h=h: _ping_probe(h, timeout_s=2.0) for h in ping_hosts]):
+
+        return  # online
+
+            # ---------- Wave 3: HTTP HEAD ----------
+
+    http_urls = ["https://www.google.com/generate_204", "https://1.1.1.1"]
+
+    if _any_success_bool([lambda u=u: _http_head(u, timeout=2.0) for u in http_urls]):
+
+        return  # online
+
+            # ---------- All failed: choose the most informative TCP reason if available ----------
+
+    if "unreach" in tcp_errors_seen:
+
+        fatal(
+
+            EXIT_NET_UNREACH,
+            "Network unreachable during URL fetch.\n\n"
+            "     Info      : The updater could not reach the target network.\n"
+            "     Info      : This can happen if your router, DNS, or ISP is blocking access.\n"
+            "     Fix       : Verify your internet settings.\n"
+            "     Fix       : Try again after reconnecting to the network."
+
+        )
+
+    if "timeout" in tcp_errors_seen:
+
+        fatal(
+
+            EXIT_NET_TIMEOUT,
+            "Network timeout during URL fetch.\n\n"
+            "     Info      : The server did not respond in the expected timeframe.\n"
+            "     Info      : This usually indicates temporary connectivity issues.\n"
+            "     Fix       : Check your internet connection.\n"
+            "     Fix       : Retry after a few minutes."
+
+        )
+
+    if "refused" in tcp_errors_seen:
+
+        fatal(
+
+            EXIT_NET_REFUSED,
+            "TCP connection refused by host.\n\n"
+            "     Info      : The host is reachable, but the target port is closed.\n"
+            "     Info      : This may happen if the server is down or blocking requests.\n"
+            "     Fix       : Verify that papermc.io is online and accessible.\n"
+            "     Fix       : Retry after a few minutes."
+
+        )
+
+    fatal(
+
+        EXIT_NET_OFFLINE,
+        "No Internet Connection detected.\n\n"
+        "     Info      : The updater was unable to connect using multiple probes.\n"
+        "     Info      : TCP, HTTPS, and DNS probes all failed.\n"
+        "     Fix       : Check your router and reconnect to the internet.\n"
+        "     Fix       : Retry once your network is online."
+
+    )
+
+
+def human_readable_size(n: int) -> str:
     """
-    Loads local version/build from version_history.json via FileUtil.
-    Returns (version, build).
+    Convert raw bytes into a formatted human-readable unit string.
+    Iteratively scales through KiB, MiB, GiB, etc., up to PiB.
+    Rounded to 2 decimals for clarity in user-facing output.
+    Primarily used in disk-space checks and status reports.
+    """
+
+    units = ["B","KiB","MiB","GiB","TiB","PiB"]
+
+    i = 0
+
+    f = float(n)
+
+    while f >= 1024 and i < len(units)-1:
+
+        f /= 1024.0
+
+        i += 1
+
+    return f"{f:.2f} {units[i]}"
+
+
+def load_local_version(serv: ServerUpdater) -> Tuple[str, int]:
+    """
+    Attempt to read the server’s local version_history.json metadata.
+    Delegates file handling to FileUtil for safety and normalization.
+    Returns (version, build) on success or ('unknown', -1) gracefully.
+    Provides a baseline before any remote API queries are made.
     """
 
     try:
@@ -150,181 +423,205 @@ def load_local_version(serv: ServerUpdater) -> tuple[str, int]:
 
     except Exception as e:
 
-        output(f"# ERROR loading local version info: {e}")
+        output(f"Error loading local version info: {e}")
 
         return ("unknown", -1)
 
 
 def load_config_old(config: dict) -> Tuple[str, int]:
     """
-    Loads configuration data from the given file.
-
-    We only load version info if it's in the official format!
-    We return the version and build number found in the configuration file.
-
-    This function looks for config data in the old format,
-    which at this time seems to be pre 1.21 (TODO: Confirm)
-    We preform a check to see if the data looks correct,
-    the current version string MUST start with 'git-Paper',
-    otherwise we will raise a value error. 
-
-    :param config: JSON data to consider
-    :type config: dict
-    :return: Tuple containing version and build data respectively
-    :rtype: Tuple[str, int]
+    Parse legacy Paper JSON configs in git-style 'git-Paper-<build>'.
+    Extracts both MC version and Paper build reliably.
+    Maintains backward compatibility for servers on old configs.
+    Raises a fatal error if structure is missing or malformed.
     """
 
     OLD_PREFIX = 'git-Paper'  # Old prefix
 
-    # Read the data, and attempt to pull some info out of it
-
     current = config['currentVersion']
-
-    # Ensure string prefix is correct:
 
     if not OLD_PREFIX == current[:len(OLD_PREFIX)]:
 
-        # Does not match! Must be invalid ...
-
         raise ValueError("Invalid old config data format!")
-
-    # Splitting the data in two so we can pull some content out:
 
     build, version = current.split(" ", 1)
 
-    # Getting build information:
-
     build = int(build.split("-")[-1])
 
-    # Getting version information:
-
     version = version[5:-1]
-
-    # Returning version information:
 
     return version, build
 
 
 def load_config_new(config: dict) -> Tuple[str, int]:
     """
-    Loads configuration data from the given file.
-
-    We only load version info if it's in the official format!
-    We return the version and build number found in the configuration file.
-
-    This function looks for config data in the new format,
-    which at this time seems to be post 1.21 (TODO: Confirm)
-
-    :param config: JSON data to consider
-    :type config: dict
-    :return: Tuple containing version and build data respectively
-    :rtype: Tuple[str, int]
+    Handle modern Paper JSON configs formatted 'MC-<ver>-<build>'.
+    Robustly extract current version and build integers.
+    Provides a clean, forward-looking path beyond legacy formats.
+    Raises a fatal error if structure is missing or malformed. 
     """
 
-    # Read the data, and attempt to pull some info out of it
+    try:
 
-    current = config['currentVersion']
+        current = config.get('currentVersion', '').strip()
 
-    # Splitting the data in two so we can pull some content out:
+        if not current:
 
-    split = current.split(" ")[0].split("-")
+            fatal(
 
-    # Getting build information:
+                EXIT_BAD_PATH,
+                "Missing 'currentVersion' field in config.\n\n"
+                "     Info      : The config file is missing the required 'currentVersion' key.\n"
+                "     Info      : This usually means the file is corrupted or incomplete.\n"
+                "     Fix       : Regenerate your config.json using a valid server jar.\n"
+                "     Fix       : Ensure the file is valid JSON and includes 'currentVersion'.",
+                target=str(config), os_error=None
 
-    build = int(split[1])
+            )
 
-    # Getting version information:
 
-    version = split[0]
+        split = current.split(" ")[0].split("-")
 
-    # Returning version information:
+        if len(split) < 2 or not split[1].isdigit():
 
-    return version, build
+            fatal(
+
+                EXIT_BAD_PATH,
+                f"Invalid 'currentVersion' field in config: {current}\n"
+                "     Info      : The folder does not exist, the path is malformed, or the location is unwritable.\n"
+                "     Fix       : Ensure the folder exists and is writable. Use -o [filename] to specify a custom jar name if needed.",
+                target=str(config)
+
+            )
+
+        build = int(split[1])
+
+        version = split[0]
+
+        return version, build
+
+    except Exception as e:
+
+        fatal(
+
+            EXIT_BAD_PATH,
+            f"Config parsing failed: {e}. "
+            "     Info      : If this is due to a PaperMC schema change"
+            "     Fix       : Rerun with --no-check to force download anyway.",
+            target=str(config)
+
+        )
 
 
 def upgrade_script(serv: ServerUpdater, force: bool = False):
     """
-    Upgrades this script.
-    
-    We do this by checking github for any new releases,
-    comparing them to our version,
-    and then updating if necessary.
-    
-    We use the ServerUpdater to do this operation for us,
-    so you will need to provide it for this function
-    to work correctly.
-
-    :param serv: ServerUpdater to use
-    :type serv: ServerUpdater
+    Perform a self-upgrade of this updater from GitHub releases.
+    Downloads the latest script, verifies its SHA256 hash, and installs.
+    On success, exits with EXIT_UPGRADE to prevent double-execution.
+    Force mode overrides version checks to always fetch latest.
     """
-
-    if not args.batch:
-
-        output("\n[ --== Starting Script Upgrade: ==-- ]\n")
-    
-    # Creating request here:
 
     req = urllib.request.Request(GITHUB_RELEASE, headers={'Accept': 'application/vnd.github.v3+json'})
 
-    # Getting data:
-
     try:
 
-        resp = urllib.request.urlopen(req)
+        resp = urllib.request.urlopen(req, timeout=2.0)
 
         data = json.loads(resp.read())
 
     except URLError as e:
 
-        # Network / DNS / timeout / refused, etc.
-
-        error_report(e, net=True)
-
-        return
+        error_report(e, net=True); return
 
     except JSONDecodeError as e:
 
-        # Got a response but it wasn't valid JSON
-
-        error_report(e)
-
-        return
+        error_report(e); return
 
     except Exception as e:
 
-        # Any other unexpected problem
-
-        error_report(e)
-
-        return
+        error_report(e); return
 
     if not force and data.get('tag_name') == __version__:
 
-        output("# No upgrade necessary!\n")
+        output("# No Upgrade Necessary!\n")
 
         return
 
     if force and data.get('tag_name') == __version__:
 
-        output("# Force script download")
+        output("# Force Script Download")
+
     else:
-        output("# New version available!")
+
+        output("# New Version Available!")
+
+    if not args.batch:
+
+        output("\n[ --== Starting Script Upgrade: ==-- ]\n")
+
+    if getattr(sys, 'frozen', False):
+
+        output("# Can't Upgrade Frozen Files!"); return
 
     url = GITHUB_RAW
 
-    path = Path(__file__).resolve().absolute()
+    target_path = Path(__file__).resolve().absolute()
 
-    # Determine if we are working in a frozen environment:
-    
-    if getattr(sys, 'frozen', False):
-        
-        print("# Can't upgrade frozen files!")
+    serv.fileutil.create_temp_dir()
 
-        return
+    tmp_file = Path(serv.fileutil.temp.name).expanduser().resolve() / 'server_update.tmp'
 
-    serv.fileutil.path = path
+    expected_sha = ""
 
-    # Getting data:
+    try:
+
+        sha_url = GITHUB_RAW.rsplit('/', 1)[0] + '/.server_update.py.sha'
+
+        sha_req = urllib.request.Request(sha_url)
+
+        with urllib.request.urlopen(sha_req, timeout=2.0) as sresp:
+
+            text = (sresp.read().decode("utf-8", "replace") or "")
+
+        for tok in text.replace("\r", " ").replace("\n", " ").split():
+
+            t = tok.strip()
+
+            if len(t) == 64 and all(c in "0123456789abcdefABCDEF" for c in t):
+
+                expected_sha = t.lower()
+
+                break
+
+    except Exception as e:
+
+        error_report(e, net=isinstance(e, URLError))
+
+        fatal(
+
+            EXIT_INTEGRITY,
+            "Missing script SHA256 (required for integrity).\n\n"
+            "     Info      : The updater could not verify the integrity of the downloaded script.\n"
+            "     Info      : The expected SHA256 hash was not provided by the server.\n"
+            "     Fix       : Ensure you are downloading from the official GitHub source.\n"
+            "     Fix       : Retry the update later or manually verify the script."
+
+        )
+
+    if not expected_sha or len(expected_sha) != 64 or any(c not in "0123456789abcdef" for c in expected_sha):
+
+        fatal(
+
+            EXIT_INTEGRITY,
+            "Malformed or missing script SHA256 (required for integrity).\n\n"
+            "     Info      : The SHA256 value was missing or not a valid 64-character hex string.\n"
+            "     Info      : This may indicate corruption or tampering.\n"
+            "     Fix       : Delete the corrupted file and retry.\n"
+            "     Fix       : Ensure your internet connection is stable."
+
+        )
+
+    output(f"# Remote File Found! -- SHA256 Ending in: {expected_sha[-10:]}")
 
     if not args.batch:
 
@@ -332,65 +629,69 @@ def upgrade_script(serv: ServerUpdater, force: bool = False):
 
     if args.batch:
 
-        output ("# Starting download...")
-
-    serv.fileutil.create_temp_dir()
-
-    temp_path = Path(serv.fileutil.temp.name).expanduser().resolve() / 'temp'
+        output("# Starting Download...")
 
     req = urllib.request.Request(url)
 
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=2.0) as resp:
 
-        total = int(resp.info().get("Content-Length", 0))
+        length = resp.length or int(resp.headers.get('Content-Length', 0))
 
-        chunk = 8192
+        blocksize = 8192
 
-        use_progress = (not args.batch and not args.quiet and total > 0)
+        total_steps = max(1, (length + blocksize - 1) // blocksize)
 
-        if use_progress:
+        with open(tmp_file, 'wb') as f:
 
-            steps = max(1, (total + chunk - 1) // chunk)
-
-        with open(temp_path, "wb") as f:
-
-            step_idx = 0
+            step = 0
 
             while True:
 
-                buf = resp.read(chunk)
+                chunk = resp.read(blocksize)
 
-                if not buf:
-
-                    if use_progress:
-
-                        progress_bar(total, chunk, steps, steps - 1)
+                if not chunk:
 
                     break
 
-                f.write(buf)
+                f.write(chunk)
 
-                if use_progress:
+                progress_bar(length, blocksize, total_steps, step)
 
-                    # call progress_bar once per chunk
+                step += 1
 
-                    progress_bar(total, chunk, steps, min(step_idx, steps - 1))
+    actual_sha = sha256(tmp_file.read_bytes()).hexdigest().lower()
 
-                    step_idx += 1
+    if actual_sha != expected_sha:
+
+        fatal(
+
+            EXIT_INTEGRITY,
+            "SHA256 mismatch for script download.\n\n"
+            "     Info      : The downloaded file does not match its expected checksum.\n"
+            "     Info      : This can happen if the file was corrupted or tampered with.\n"
+            "     Fix       : Delete the corrupted file and re-run the updater.\n"
+            "     Fix       : Ensure your network connection is stable.",
+            target=str(tmp_file), os_error=None
+
+        )
+
+    else:
+
+        output(f"# Integrity Test Passed! -- SHA256 Ending in: {actual_sha[-10:]}")
+
+    output(f"# Saved file to: {tmp_file}")
 
     if not args.batch:
 
         output("\n[ --== Download Complete! ==-- ]")
 
-    if args.batch:
+    else:
 
         output("# Download complete!")
 
-    # Move the new script:
+    serv.fileutil.path = target_path
 
-    serv.fileutil.install(temp_path, path)
-
-    # We are done!
+    serv.fileutil.install(tmp_file, target_path)
 
     if not args.batch:
 
@@ -398,16 +699,17 @@ def upgrade_script(serv: ServerUpdater, force: bool = False):
 
     else:
 
-        output("# Script upgrade complete!")
+        output("# Script Upgrade Complete!")
 
-    sys.exit(2)
+    sys.exit(EXIT_UPGRADE)
 
 
-def output(text: str, args=None):
+def output(text: str):
     """
-    Outputs text to the terminal via print.
-    Will not print content if we are in quiet mode,
-    and will apply batch-mode filters if in batch mode.
+    Central logging function aware of batch/quiet flags.
+    Routes messages through stdout with optional suppression.
+    Filters redundant blank lines for clean console presentation.
+    Guarantees consistent user messaging across all modules.
     """
 
     if args.quiet:
@@ -429,84 +731,13 @@ def output(text: str, args=None):
     print(text.strip() if args.batch else text)
 
 
-def error_report(exc, net: bool=False):
+def progress_bar(length: int, stepsize: int, total_steps: int, step: int, prefix: str="# Downloading:", size: int=60, prog_char: str="#", empty_char: str="."):
     """
-    Function for displaying error information to the terminal.
-
-    :param exc: Exception object
-    :param net: Whether to include network information
-    :type net: bool
+    Render an ASCII progress bar showing download completion.
+    Scales proportionally to length and step counters supplied.
+    Provides user feedback during long transfers or copies.
+    Disabled in quiet/batch modes.
     """
-
-    print("+=================================================+")
-    print("  [ --== The Following Error Has Occurred: ==-- ]")
-    print("+=================================================+")
-
-    # Print error name
-
-    print("Error Name: {}".format(exc))
-    print("+=================================================+")
-
-    # Print full traceback:
-
-    print("Full Traceback:")
-    traceback.print_exc()
-
-    if net:
-
-        # Include extra network information
-
-        print("+=================================================+")
-        print("Extra Network Information:")
-
-
-        if hasattr(exc, 'url'):
-
-            print("Attempted URL: {}".format(exc.url))
-
-        if hasattr(exc, 'reason'):
-
-            print("We failed to reach the server.")
-            print("Reason: {}".format(exc.reason))
-
-        if hasattr(exc, 'code'):
-
-            print("The server could not fulfill the request.")
-            print("Error code: {}".format(exc.code))
-
-    print("+=================================================+")
-    print("(Can you make anything of this?)")
-    print("Please check the github page for more info: https://github.com/Creeper36/PaperMC-Update.")
-
-    return
-
-
-def progress_bar(length: int, stepsize: int, total_steps: int, step: int, prefix: str="Downloading:", size: int=60, prog_char: str="#", empty_char: str="."):
-    """
-    Outputs a simple progress bar to stdout.
-
-    We act as a generator, continuing to iterate and add to the bar progress
-    as we download more information.
-
-    :param length: Length of data to download
-    :type length: int
-    :param stepsize: Size of each step
-    :type stepsize: int
-    :param total_steps: Total number of steps
-    :type total_steps: int
-    :param step: Step number we are on
-    :type step: int
-    :param prefix: Prefix to use for the progress bar
-    :type prefix: str
-    :param size: Number of characters on the progress bar
-    :type size: int
-    :param prog_char: Character to use for progress
-    :type prog_char: str
-    :param empty_char: Character to use for empty progress
-    :type empty_char: str
-    """
-
-    # Calculate number of '#' to render:
 
     x = int(size*(step+1)/total_steps)
 
@@ -529,204 +760,170 @@ def progress_bar(length: int, stepsize: int, total_steps: int, step: int, prefix
 
 class Update:
     """
-    Server updater, handles checking, downloading, and moving.
-
-    This class facilitates communication between this script and the Paper v2 API.
-    We offer methods to retrieve available versions, builds, 
-    and other information about downloads.
-    Users can download the final jar file using this class as well.
-    We also offer the ability to generate download URLs,
-    so the user can download the files in any way they see fit. 
+    PaperMC downloads client with v3 primary and v2 fallback.
+    Caches HTTP JSON, builds URLs, and resolves artifacts robustly.
+    Normalizes version/build lists across API shapes and schema drift.
+    Provides verified, resumable-style downloads via streaming reads.
     """
 
     def __init__(self, user_agent: str = ''):
+        """
+        Initialize HTTP bases, default headers, and a local response cache.
+        Accepts an optional custom User-Agent to satisfy API policy.
+        Prefers v3 endpoints while retaining seamless v2 compatibility.
+        Keeps minimal mutable state: base URL, cache, and download path.
+        """
 
-        self._base = 'https://fill.papermc.io/v3/projects/paper'  # Base URL to build of off
+        self._base_v3 = 'https://fill.papermc.io/v3/projects/paper'
+
+        self._base_v2 = 'https://api.papermc.io/v2/projects/paper'
+
+        self._base = self._base_v3
 
         self._headers = {
-             'Content-Type': 'application/json;charset=UTF-8',
-             'Accept': 'application/json, text/plain, */*',
-             'User-Agent': f'PaperMC-Update/{__version__} (https://github.com/Creeper36/PaperMC-Update)',
-             'Accept-Language': 'en-US,en;q=0.5',
-             'DNT': '1',
-         }
 
-        # Determine if we need to change the user agent in the headers
+             'Content-Type': 'application/json;charset=UTF-8',
+
+             'Accept': 'application/json, text/plain, */*',
+
+             'User-Agent': f'PaperMC-Update/{__version__} (https://github.com/Creeper36/PaperMC-Update)',
+
+             'Accept-Language': 'en-US,en;q=0.5',
+
+             'DNT': '1',
+
+        }
 
         if user_agent:
 
-          # We must change the user agent to the provided value
+            self._headers['User-Agent'] = user_agent
 
-          self._headers['User-Agent'] = user_agent
+        self.download_path = ''
 
-        self.download_path = ''  # Path the file was downloaded to
+        self.cache = {}
 
-        self.cache = {}  # A basic cache for saving responses
 
     def _none_function(self, length, blocksize, total, step, *args, **kwargs):
         """
-        Dummy function that does nothing.
+        No-op progress callback used when none is provided by the caller.
+        Preserves a stable signature for download hooks and testing.
+        Eliminates conditional branches in the hot download loop.
+        Safe to call arbitrarily with unused positional/keyword args.
         """
 
         pass
 
+
     def version_convert(self, ver: str) -> Tuple[int,int,int]:
         """
-        Converts the version string into a tuple that can be used for comparison.
-
-        This tuple contains three numbers, each of which can be used
-        in equality operations.
-        This can be used to determine if a given version is greater or lessor than another.
-
-        :param ver: Version string to convert
-        :type ver: str
-        :return: Tuple contaning version information
-        :rtype: Tuple[int,int,int]
+        Convert semantic-like versions into (major, minor, patch) ints.
+        Ignores suffixes (pre/rc/+meta) and zero-fills missing parts.
+        Enables robust numeric sorting across heterogeneous tags.
+        Returns a strict, comparable tuple for downstream selection.
         """
 
-        # Convert and return the tuple:
+        core = ver.split('-', 1)[0].split('+', 1)[0].strip()
 
-        temp: List[int] = []
+        nums: List[int] = []
 
-        for item in ver.split('.'):
+        for token in core.split('.'):
 
-            # Convert and add the item:
+            m = re.match(r'(\d+)', token)
 
-            temp.append(int(item))
+            nums.append(int(m.group(1)) if m else 0)
 
-        return (temp[0], temp[1], temp[2])
+        while len(nums) < 3:
 
-    def build_data_url(self, version: str=None, build_num: int=None) -> str:
+            nums.append(0)
+
+        return (nums[0], nums[1], nums[2])
+
+
+    def build_data_url(self, version: Optional[str] = None, build_num: Optional[int] = None) -> str:
         """
-        Builds a valid URL for retrieving version data.
-
-        The user can use this URL to retrieve various versioning data.
-
-        If version and build_num are not specified,
-        then general paper info is returned:
-
-        https://papermc.io/api/v2/projects/paper
-
-        If build_num is not specified, 
-        then general data about the specified data is returned:
-
-        https://papermc.io/api/v2/projects/paper/versions/[version]
-
-        If both arguments are provided,
-        then data about the specific version and build is returned:
-
-        https://papermc.io/api/v2/projects/paper/versions/[version]/builds/[build_num]
-
-        :param version: Version to fetch info for, defaults to None
-        :type version: str, optional
-        :param build_num: Build number to get info for, defaults to None
-        :type build_num: int, optional
-        :return: URL of the data
-        :rtype: str
+        Construct the metadata URL for project/version/build resources.
+        Root (None,None) yields the project index; deeper paths are nested.
+        Stays agnostic to base (v3/v2) so callers can swap transparently.
+        Produces clean, slash-joined paths without trailing artifacts.
         """
-
-        # Building url:
 
         final = self._base
 
         if version is not None:
 
-            # Specific version requested:
-
             final = final + '/versions/' + str(version)
 
             if build_num is not None:
 
-                # Specific build num requested:
-
                 final = final + '/builds/' + str(build_num)
-
-        # Return the URL:
 
         return final
 
-    def build_download_url(self, version: str, build_num:int) -> dict[str, dict[str, Union[str, int, dict[str, str]]]]:
+
+    def build_download_url(self, version: str, build_num: int) -> Dict[str, Any]:
         """
-        Builds a valid download URL that can be used to download a file.
-        We use the version and build number to generate this URL.
-
-        The user can use this URL to download the file
-        using any method of their choice.
-        In addition to the download URL,
-        we also provide the filesize, SHA256 checksum, and default filename.
-
-        :param version: Version to download
-        :type version: str
-        :param build_num: Build number to download, defaults to 'latest'
-        :type build_num: str, optional
+        Read build metadata and select the primary server artifact.
+        Prefers 'server:default' but falls back to 'application' when needed.
+        Returns a small map: name, url, size, and checksums if available.
+        Raises via callers if metadata is missing or malformed.
         """
 
-        ##
-        # New in V3
-        ##
+        downloads = self.decode_json_metadata(version, build_num).get("downloads", {})
 
-        # The API now directly gives us a download URL,
-        # Along with the size, checksum, and default filesname.
-        # We now return the download URL, along with these newly provided values.
+        return downloads.get("server:default") or downloads.get("application") or {}
 
-        # Make the call, extract the relevant data, and return
-
-        return self.get(version, build_num)['downloads']['server:default']
-
+        
     def download_response(self, url: str) -> HTTPResponse:
         """
-        Calls the underlying urllib library and return the object generated.
-
-        This object is usually a HTTPResponse object.
-        The user can use this object in any way they see fit.
-        Users MUST provide a URL to a file to download!
-        
-        :param url: URL of file to download
-        :type url: str
-        :return: Object returned by urllib
-        :rtype: HTTPResponse
+        Issue a timed HTTP request with strict headers and return the stream.
+        Maps recoverable network failures to a unified EXIT_NET_DL fatal.
+        Keeps API-specific status handling outside the download path.
+        Always returns a live file-like object on success.
         """
 
-        # Creating request here:
-
+        import socket
+        
         req = urllib.request.Request(url, headers=self._headers)
 
-        # Sending request to Paper API
+        try:
 
-        return urllib.request.urlopen(req)
+            return urllib.request.urlopen(req, timeout=2.0)
+
+        except ssl.SSLError as e:
+
+            fatal(
+
+                EXIT_NET_SSL,
+                "SSL error during file download.\n\n"
+                "     Info      : The SSL handshake failed or certificate was invalid.\n"
+                "     Fix       : Check your system clock, CA certs, or try again later.\n",
+                target=url, os_error=None
+
+            )
+
+        except (HTTPError, URLError, TimeoutError, socket.timeout, ConnectionError) as e:
+
+            error_report(e, net=True)
+
+            fatal(
+
+                EXIT_NET_DL,
+                "Network error while downloading Paper jar.\n\n"
+                "     Info      : The download failed due to connectivity issues.\n"
+                "     Info      : This may be caused by packet loss or server issues.\n"
+                "     Fix       : Verify your internet connection.\n"
+                "     Fix       : Retry download later.",
+                target=url, os_error=None
+
+            )
+
 
     def download_file(self, path: Path, version: str, build_num:int, check:bool=True, call: Callable=None, args: List=None, blocksize: int=4608) -> Path:
         """
-        Downloads the content to the given external file.
-        We handle all file operations,
-        and automatically work with the URLResponse objects
-        to write the file contents to an external file.
-
-        If a directory is provided, 
-        then we will use the recommended name of the file,
-        and save it to the directory provided.
-
-        Users can also pass a function to be called upon each block of the download.
-        This can be useful to visualize or track downloads.
-        We will pass the total length, stepsize, total steps, and step number.
-        The args provided in the args parameters will be passed to the function as well.
-
-        :param path: Path to directory to write to
-        :type path: str
-        :param version: Version to download
-        :type version: str
-        :param build_num: Build to download
-        :type build_num: int
-        :param check: Boolean determining if we should check the integrity of the file
-        :type check: bool
-        :param call: Method to call upon each download iteration
-        :type call: Callable
-        :param args: Args to pass to the callable
-        :type args: List
-        :param blocksize: Number of bytes to read per copy operation
-        :type blocksize: int
-        :return: Path the file was saved to
-        :raises: ValueError: If file integrity check fails
+        Stream an artifact to disk with incremental progress callbacks.
+        Honors a fixed block size and computes total steps for UI feedback.
+        Optionally verifies SHA-256 and fatals on mismatch for safety.
+        Returns the final file path; caller handles post-processing.
         """
 
         if args is None:
@@ -739,270 +936,375 @@ class Update:
 
             args = []
 
-        # First, get the file data
-
         ddata = self.build_download_url(version, build_num)
 
-        # Get the data:
+        name = str(ddata.get("name", ""))
 
-        data = self.download_response(str(ddata['url']))
+        expected_hash = str((ddata.get("checksums") or {}).get("sha256", ""))
 
-        # Get filename for download:
+        url = ddata.get("url") or f"{self.build_data_url(version, build_num)}/downloads/{name}"
+
+        data = self.download_response(url)
 
         if path.is_dir():
 
-            # Use the default name:
+            path = path / name
 
-            path = path / str(ddata['name'])
+        length: int = int(ddata.get("size") or 0)
 
-        # Get length of file:
+        total_steps = max(1, (length + blocksize - 1) // blocksize)
 
-        length: int = int(ddata['size'])
+        with open(path, mode='wb+') as file:
 
-        total = ceil(length/blocksize) + 1
+            step = 0
 
-        # Open the file, we want to read it as well for verification,
-        # so we specify the + symbol to open for reading and writing
+            while True:
 
-        file = open(path, mode='bw+')
+                chunk = data.read(blocksize)
 
-        # Copy the downloaded data to the file:
+                if not chunk:
 
-        for i in range(total):
+                    break
 
-            # Call the method:
+                file.write(chunk)
 
-            call(length, blocksize, total, i, *args)
+                call(length, blocksize, total_steps, step, *args)
 
-            # Get the data:
+                step += 1
 
-            file.write(data.read(blocksize))
+        if check:
 
-        # Ensure the right checksum is available
-        # (According to the schema, they only provide sha256 sums, but better be safe than sorry)
+            checksums = ddata.get("checksums") or {}
 
-        if check and 'sha256' in ddata['checksums'].keys():
+            expected = checksums.get("sha256")
 
-            # Get the ideal SHA256 hash for the file:
+            if expected:
 
-            hash = ddata['checksums']['sha256']
+                with open(path, "rb") as file:
 
-            # We gotta seek to the beginning of the file,
-            # since our pointer is now at the end
+                    actual = sha256(file.read()).hexdigest()
 
-            file.seek(0)
+                if actual.lower() != expected.lower():
 
-            # Now checking integrity, again we only expect to work with SHA256
+                    output("\n" + "="*60)
 
-            if not sha256(file.read()).hexdigest() == hash:
+                    output("###   FATAL ERROR: SHA-256 INTEGRITY CHECK FAILED   ###")
 
-                # File integrity failed! Do something...
+                    output("="*60 + "\n")
 
-                raise ValueError("File integrity check failed!")
+                    output(f"Expected: {expected}")
 
-        # Closing file:
+                    output(f"Actual:   {actual}")
 
-        file.close()
+                    fatal(
+
+                        EXIT_INTEGRITY,
+                        "Integrity verification failed (SHA-256 mismatch).\n\n"
+                        "     Info      : The downloaded file’s checksum does not match the expected value.\n"
+                        "     Info      : This can happen due to corruption or tampering.\n"
+                        "     Fix       : Delete the corrupted file and retry.\n"
+                        "     Fix       : Ensure your disk and network connection are stable.",
+                        target=str(path), os_error=None
+
+                    )
+
+
+                output(f"# Integrity Test Passed! -- SHA256 Ending in: {actual[-10:]}")
+
+            else:
+
+                output("# Warning: Integrity Check Skipped (no SHA-256 provided by API)")
+
+        else:
+
+            output("# Integrity Check Skipped (forced: --no-integrity)")
 
         return path
 
-    def get_versions(self) -> list[str]:
+
+    def get_versions(self) -> List[str]:
         """
-        Gets available versions of the server.
-
-        The list of versions is a tuple of strings.
-        Each version follows the Minecraft game version conventions.
-
-        :return: List of available versions
+        Fetch project versions and normalize across dict/list schemas.  
+        Flattens v3 maps, preserves order, then reverses oldest→newest.
+        Guarantees latest is at the end for consistent [-1] selection.
+        Caches responses to minimize network churn in repeated calls.
         """
 
-        # Get the version map
+        raw = self.decode_json_metadata().get('versions', [])
 
-        vmap: dict[str, list[str]] = self.get()['versions']
+        if isinstance(raw, dict):
 
-        ##
-        # New in V3
-        ##
+            out = []
 
-        # The API now provides us with a dictionary mapping major versions with sub-versions.
-        # Previously, it was like this: ['1.14.4', '1.14.3', '1.14.2', '1.14.1', '1.14', '1.13.2', ...]
-        # Now, it is like this: {'1.14': ['1.14.4', '1.14.3', '1.14.2', '1.14.1', '1.14'], '1.13': [...], ...}
-        # In addition, the order of releases are reversed, it used to be oldest -> newest, but now it's newest -> oldest
-        # So, for compatibility reasons, we need to squish this mapping of arrays in a single array, and then reverse sort it
+            for _, vals in raw.items():
 
-        # Define final array to contain results
+                out.extend(vals)
 
-        versions: list[str] = []
+            versions = out
 
-        # Iterate over each key and value in the mapping
+        else:
 
-        for _, value in vmap.items():
-
-            # Iterate over each version in the values
-
-            for val in value:
-
-                # Add the value to the master list
-
-                versions.append(val)
-
-        # Versions in dictionary are in order
-        # (Dictionary keys are in the order they are added since python 3.7, the minimum python version),
-        # but we need to reverse
+            versions = list(raw)
 
         versions.reverse()
 
-        # Finally, return the version info
-
         return versions
 
-    def get_buildnums(self, version: str) -> list[int]:
+
+    def get_buildnums(self, version: str) -> List[int]:
         """
-        Gets available build for a particular version.
-
-        The builds are a tuple of ints,
-        which follow PaperMC build number conventions.
-
-        :param version: Version to get builds for
-        :type version: str
-        :return: List of builds
-        :rtype: Tuple[int,...]
+        Retrieve integer build numbers for a specific game version.
+        Normalizes ordering and reverses so newest is positioned last.
+        Ensures max(builds) and builds[-1] converge in typical cases.
+        Resilient to sparse or non-contiguous build sequences.
         """
 
-        ##
-        # New in V3
-        ##
-
-        # The build numbers are now reversed, going from newest to oldest.
-        # This script expects the build numbers to be from oldest to newest,
-        # So we will reverse this list
-
-        # Get the list from the API
-
-        builds: list[int] = self.get(version)['builds']
-
-        # Reverse the list
+        builds: List[int] = self.decode_json_metadata(version)['builds']
 
         builds.reverse()
 
-        # Return the build info
-
         return builds
 
-    def get(self, version: str=None, build_num: int=None) -> dict:
+
+    def fetch_raw_api(self, version: Optional[str], build_num: Optional[int]) -> IO[bytes]:
         """
-        Gets RAW data from the Paper API, version info only.
-
-        We utilize some basic caching to remember responses
-        instead of calling the PaperMC API multiple times. 
-
-        You can use this to get a list of valid versions,
-        list of valid builds per version,
-        as well as general data related to the selected version.
-
-        You should check out:
-
-        https://paper.readthedocs.io/en/latest/site/api.html
-        https://papermc.io/api/docs/swagger-ui/index.html?configUrl=/api/openapi/swagger-config#/
-
-        For more information on PaperMC API formatting.
-
-        We return the data in a dictionary format.
-
-        :param version: Version to include in the URL
-        :type version: str
-        :param build_num: Build number to include in the URL
-        :type build_num: int
-        :return: Dictionary of request data
-        :rtype: dict
+        Attempt v3, then fall back to v2 with a single clear notice.
+        Classifies timeouts, HTTP, URL, and connection errors to EXIT_*.
+        Returns an open response stream upon first successful attempt.
+        Updates self._base to the working endpoint for future calls.
         """
 
-        # Generate URL:
+        def try_request(base_url: str):
 
-        url = self.build_data_url(version, build_num)
+            url = self.build_data_url(version, build_num).replace(self._base, base_url)
 
-        # Check if we have saved content:
+            req = urllib.request.Request(url, headers=self._headers)
 
-        if url in self.cache.keys():
+            return urllib.request.urlopen(req, timeout=2.0), url
 
-            # We have cached content:
+        fallback_noted = False
+
+        for base in [self._base_v3, self._base_v2]:
+
+            try:
+
+                resp, url = try_request(base)
+
+                if base != self._base:
+
+                    self._base = base
+
+                return resp
+
+            except (TimeoutError, socket.timeout):
+
+                if base == self._base_v3:
+
+                    if not fallback_noted:
+
+                        output("# V3 API Failed.. Attempting Fallback to V2 API ..... ")
+
+                        fallback_noted = True
+
+                    continue
+
+                fatal(
+
+                    EXIT_NET_TIMEOUT,
+                    "Network timeout during URL fetch.\n\n"
+                    "     Info      : The server did not respond in the expected timeframe.\n"
+                    "     Info      : This usually indicates temporary connectivity issues.\n"
+                    "     Fix       : Check your internet connection.\n"
+                    "     Fix       : Retry after a few minutes.",
+                    target=base, os_error=None
+
+                )
+            
+            except HTTPError as e:
+
+                if base == self._base_v3:
+
+                    if not fallback_noted:
+
+                        output("# V3 API Failed.. Attempting Fallback to V2 API ..... ")
+
+                        fallback_noted = True
+
+                    continue  # try v2
+
+                fatal(
+
+                    EXIT_NET_DL,
+                    "Connection error during URL fetch.\n\n"
+                    "     Info      : The updater attempted to connect but the connection failed.\n"
+                    "     Info      : Causes may include firewalls, DNS issues, or server downtime.\n"
+                    "     Fix       : Verify papermc.io is reachable from your network.\n"
+                    "     Fix       : Retry later or check firewall rules.",
+                    target=base, os_error=_errno(e)
+
+                )
+
+            except ssl.SSLError as e:
+
+                fatal(
+
+                    EXIT_NET_SSL,
+                    "SSL error during URL fetch.\n\n"
+                    "     Info      : A problem occurred during SSL handshake or certificate validation.\n"
+                    "     Info      : This may be due to an invalid certificate or outdated system CA.\n"
+                    "     Fix       : Check your system clock and ensure certificates are up-to-date.\n"
+                    "     Fix       : Retry with a stable network or updated Python/OS.",
+                    target=base, os_error=None
+
+                )
+
+            except URLError as e:
+
+                reason = getattr(e, "reason", None)
+
+                eno = _errno(reason) if isinstance(reason, OSError) else _errno(e)
+
+                if eno in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+
+                    fatal(
+
+                        EXIT_NET_UNREACH,
+                        "Network unreachable during URL fetch.\n\n"
+                        "     Info      : The updater could not reach the target network.\n"
+                        "     Info      : This can happen if your router, DNS, or ISP is blocking access.\n"
+                        "     Fix       : Verify your internet settings.\n"
+                        "     Fix       : Try again after reconnecting to the network.",
+                        target=base, os_error=eno
+
+                    )
+
+                if base == self._base_v3:
+
+                    if not fallback_noted:
+
+                        output("# V3 API Failed.. Attempting Fallback to V2 API ..... ")
+
+                        fallback_noted = True
+
+                    continue
+
+                fatal(
+
+                    EXIT_NET_URL,
+                    "URL error during URL fetch.\n\n"
+                    "     Info      : The provided URL was invalid or inaccessible.\n"
+                    "     Info      : A malformed URL or DNS failure may be the cause.\n"
+                    "     Fix       : Verify the target URL in your config.\n"
+                    "     Fix       : Retry after correcting the URL.",
+                    target=base, os_error=eno
+
+                )
+
+            except ConnectionError as e:
+
+                if base == self._base_v3:
+
+                    if not fallback_noted:
+
+                        output("# V3 API Failed.. Attempting Fallback to V2 API ..... ")
+
+                        fallback_noted = True
+
+                    continue
+
+                error_report(e, net=True)
+
+                fatal(
+
+                    EXIT_NET_DL,
+                    "Connection error during URL fetch.\n\n"
+                    "     Info      : The updater attempted to connect but the connection failed.\n"
+                    "     Info      : Causes may include firewalls, DNS issues, or server downtime.\n"
+                    "     Fix       : Verify papermc.io is reachable from your network.\n"
+                    "     Fix       : Retry later or check firewall rules.",
+                    target=base, os_error=_errno(e)
+
+                )
+
+        fatal(
+
+            EXIT_NET_DL,
+            "Both v3 and v2 API requests failed.\n\n"
+            "     Info      : The updater attempted to query both PaperMC v3 and v2 APIs, but both calls failed.\n"
+            "     Info      : This usually indicates a PaperMC server outage or severe connectivity problem.\n"
+            "     Fix       : Check https://papermc.io/ for current status.\n"
+            "     Fix       : Retry later once the API is available again.",
+            target=f"{self._base} and {self._base_v2}", os_error=None
+
+        )
+
+
+    def decode_json_metadata(self, version: str | None = None, build_num: int | None = None) -> Dict[str, Any]:
+        """
+        Load and cache project/version/build JSON metadata.
+        Uses v2 for root listing; otherwise honors the active base URL.
+        Keyed by fully-resolved URL to segregate cache entries correctly.
+        Returns a parsed dict ready for selection and download steps.
+        """
+
+        if version is None and build_num is None:
+
+            base_url = self._base_v2
+
+        else:
+
+            base_url = self._base
+
+        url = self.build_data_url(version, build_num).replace(self._base, base_url)
+
+        if url in self.cache:
 
             return self.cache[url]
 
-        # Get the data and return:
-
-        data = json.loads(self._get(version, build_num).read())
-
-        # Cache it:
+        data = json.loads(self.fetch_raw_api(version, build_num).read())
 
         self.cache[url] = data
-
-        # Return the final data:
-
-        return data
-
-    def _get(self, version: str=None, build_num: int=None) -> HTTPResponse:
-        """
-        Gets raw data from the PaperMC download API.
-
-        This method generates the relevant URLs and returns
-        the HTTPResponse object representing the request.
-
-        :param version: Version to get info for, defaults to None
-        :type version: str, optional
-        :param build_num: Build to get info for, defaults to None
-        :type build_num: int, optional
-        :return: HTTPResponse representing the request
-        :rtype: HTTPResponse
-        """
-
-        final = self.build_data_url(version, build_num)
-
-        # Check if the URL is present in the cache:
-
-        if final in self.cache.keys():
-
-            # Cached content is found, return THAT:
-
-            return self.cache[final]
-
-        # Creating request here:
-
-        req = urllib.request.Request(final, headers=self._headers)
-
-        # Getting data:
-
-        data = urllib.request.urlopen(req)
-
-        # Saving data:
-
-        self.cache[final] = data
 
         return data
 
 
 class FileUtil:
     """
-    Class for managing the creating/deleting/moving of server files.
+    Encapsulate filesystem operations for portability and safety.
+    Manages temp dirs, config discovery, backups, and atomic moves.
+    Abstracts Windows vs POSIX differences in replace semantics.
+    Centralizes error handling for clean rollbacks on failure.
     """
 
     def __init__(self, path, interactive=False):
+        """
+        Resolve target path, initialize backup state, and flags.
+        Interactive mode adjusts messages and certain copy behaviors.
+        Accepts files or directories as install destinations.
+        Keeps absolute, expanded Paths for consistent downstream use.
+        """
 
         self.path: Path = Path(path).expanduser().resolve().absolute()
 
         self.temp: tempfile.TemporaryDirectory
 
-        self.config_default = 'version_history.json'
+        self.config_default: str = 'version_history.json'
 
-        self.target_path = ''
+        self.target_path: str = ''
 
-        self.interactive = interactive
+        self.interactive: bool = interactive
+
+        self.backup: Optional[Path] = None
+
+        self.backed_up: bool = False
+
 
     def create_temp_dir(self):
         """
-        Creates a temporary directory.
-
-        :return: Temp file instance
+        Create a dedicated TemporaryDirectory for staging artifacts.
+        Stores a handle for later cleanup and backup placement.
+        Returns the context so callers can access .name if needed.
+        Ensures isolation from the target directory during writes.
         """
 
         self.temp = tempfile.TemporaryDirectory()
@@ -1011,24 +1313,23 @@ class FileUtil:
 
     def close_temp_dir(self):
         """
-        Closes created temporary directory.
+        Tear down the previously created TemporaryDirectory.
+        Frees temporary storage regardless of install outcome.
+        Safe to call once after create_temp_dir() completes work.
+        No-op if temp dir has already been cleaned up externally.
         """
 
         self.temp.cleanup()
 
     def load_config(self, config: str) -> Tuple[str, int]:
         """
-        Loads configuration info from 'version_history.json' in the server directory
-        We only load version info if it's in the official format!
-
-        :param config: Path to config file
-        :type config: str
-        :return: (version, build)
+        Discover and parse version_history.json with parent fallbacks.
+        Supports legacy and modern formats via dedicated parsers.
+        Returns ('0', 0) on failure without raising to the caller.
+        Emits context messages for traceable resolution steps.
         """
 
         if config is None:
-
-            # Need to determine our config path:
 
             if self.path.is_dir():
 
@@ -1042,13 +1343,11 @@ class FileUtil:
 
         if not Path(config).is_file():
 
-            # Walk upwards until root
-
             current = Path(config).parent
 
             found = None
 
-            while current != current.parent:  # stop at filesystem root
+            while current != current.parent:
 
                 candidate = current / Path(config).name
 
@@ -1080,31 +1379,23 @@ class FileUtil:
 
                     else:
 
-                        print("# Unable to load config data from file [{}] - Not found in any parent directories!".format(config))
+                        output("# Unable to load config data from file [{}] - Not found in any parent directories!".format(config))
 
                         return '0', 0
 
                 else:
 
-                    print("# Unable to load config data from file [{}] - Not found in any parent directories!".format(config))
+                    output("# Unable to load config data from file [{}] - Not found in any parent directories!".format(config))
 
                     return '0', 0
 
-        # Load file content
-
         try:
 
-            # Open file
-
             with open(config, 'r') as file:
-
-                # Decode file
 
                 data = json.load(file)
 
         except JSONDecodeError:
-
-            # Data not in valid JSON format.
 
             output("# Failed to load config data - Not in JSON format!")
 
@@ -1112,17 +1403,11 @@ class FileUtil:
 
         try:
 
-            # First, try old format...
-
             return load_config_old(data)
 
         except Exception:
 
-            # Did not work, try something else ...
-
             pass
-
-        # Try new format:
 
         try:
 
@@ -1130,47 +1415,26 @@ class FileUtil:
 
         except Exception:
 
-            # Extra weird errors due to formatting issues:
-
             output("# Failed to load config data - Strange format, we support official builds only!")
 
             return '0', 0
 
+
     def install(self, file_path: str, new_path: str, target_copy: str=None, backup=True, new=False):
         """
-        "Moves" the contents of the temporary file into the target in the root server directory.
-
-        The new file should exist in the temporary directory before this method is invoked!
-
-        We backup the old jar file by default to the temporary directory,
-        and we will attempt to recover the old jar file in the event of any failures.
-        This feature can be disabled.
-
-        :param file_path: The path to the new file to move
-        :type new_file: str
-        :param new_path: Path to move the file to
-        :type new_path: str
-        :param target_copy: Where to copy the old file to
-        :type target_copy: str
-        :param file_name: What to rename the new file to, None for no change
-        :type file_name: str
-        :param backup: Value determining if we should back up the old file
-        :type backup: bool
-        :param new: Determines if we are doing a new download, aka if we care about file operation errors
-        :type new: bool
+        Install the downloaded jar with backup and rollback support.
+        Windows deletes/replaces directly; POSIX uses staged atomics.
+        Maps permission, path, and space errors to specific EXIT_* codes.
+        Returns True on success; False if rollback recovered the old file.
         """
 
-        if not args.upgrade:
-
-            output("\n[ --== Moving Files To Target: ==-- ]\n")
+        output("\n[ --== Moving Files To Target: ==-- ]\n")
 
         if self.interactive:
 
             output(f"# Interactive mode: moving as '{self.path.name}'")
 
         else:
-
-            # === AUTOMATED MODE: Validate, back up, and move/replace
 
             if target_copy is not None and self.path.is_file():
 
@@ -1192,117 +1456,364 @@ class FileUtil:
 
                 output("# Creating backup of previous file ...")
 
-                try:
+                self.create_backup()
 
-                    shutil.copyfile(self.path, Path(self.temp.name) / 'backup')
+            final_path = self.path.parent / new_path
 
-                except Exception as e:
+            if _is_windows():
 
-                    self._fail_install("File Backup")
+                if self.path.is_file():
 
-                    error_report(e)
+                    output(f"# Deleting existing file at {self.path} ...")
 
-                self.target_path = new_path
+                    try:
+                        os.remove(self.path)
 
-                output(f"# Backup created at: {Path(self.temp.name) / 'backup'}")
+                    except PermissionError as e:
 
-            try:
+                        if getattr(e, "winerror", None) == 32:
 
-                final_path = self.path.parent / new_path
+                            fatal(
 
+                                EXIT_FILE_LOCKED,
+                                f"Cannot delete '{self.path.name}', it is currently In-Use / Locked.\n\n"
+                                "     Info      : Another process is holding this file open.\n"
+                                "     Fix       : Stop the Minecraft server and try again.\n"
+                                "     Fix       : Restart your PC if the file remains locked."
 
-                if _is_windows():
+                            )
 
-                    # ---- Windows path (keep old behavior) ----
+                        else:
 
-                    if self.path.is_file():
+                            fatal(
 
-                        output("# Deleting existing file at {} ...".format(self.path))
+                                EXIT_PERM,
+                                "Permission denied while writing or replacing a file.\n\n"
+                                "     Info      : This occurs when your user account lacks write privileges.\n"
+                                "     Info      : On Linux/macOS, files may belong to root or another user.\n"
+                                "     Fix       : Run the updater with elevated privileges (Administrator / sudo).\n"
+                                "     Fix       : Ensure the target directory is writable by your account.",
+                                f"Target: {self.path}"
+
+                            )
+
+                    except Exception as e:
+
+                        self._fail_install("Old File Deletion")
+
+                        error_report(e)
 
                         try:
 
-                            os.remove(self.path)
+                            if self.backed_up and self.backup and Path(self.backup).exists():
 
-                        except PermissionError as e:
+                                if self._recover_backup():
 
-                            if getattr(e, "winerror", None) == 32:
+                                    output("Rollback successful: old file restored from backup.")
 
-                                output(f"\n# [ERROR] Cannot delete '{self.path.name}', it is currently locked / IN-USE.")
+                                    return False
 
-                                output("# Please close the Minecraft server (or any process using this file) and try again.")
+                        except Exception:
 
-                                sys.exit(10)
+                            pass
 
-                            else:
+                        fatal(
 
-                                raise
+                            EXIT_ATOMIC,
+                            "Atomic replace failed and rollback unsuccessful.\n\n"
+                            "     Info      : The updater attempted to replace the target file, but both main\n"
+                            " replace and rollback failed.\n"
+                            "     Fix       : Close all processes accessing the file.\n"
+                            "     Fix       : Run with elevated permissions and retry.",
+                            target=final_path, os_error=None
 
-                        except Exception as e:
+                        )
 
-                            self._fail_install("Old File Deletion")
-                            error_report(e)
+                output(f"# Moving download data to target location: {final_path}")
 
-                            sys.exit(10)
-
-                        output("# Removed original file!")
-
-                    # Copy new file into place
-
-                    output("# Moving download data to target location ...")
-
-                    output(f"# ({file_path} > {final_path})")
+                try:
 
                     shutil.copyfile(file_path, final_path)
 
-                else:
+                except PermissionError as e:
 
-                    # ---- POSIX (Linux/Unix/macOS): atomic replace ----
+                    fatal(
 
-                    output("# Moving download data to target location (staged replace) ...")
+                        EXIT_PERM,
+                        "Permission denied while writing or replacing a file.\n\n"
+                        "     Info      : This occurs when your user account lacks write privileges.\n"
+                        "     Info      : On Linux/macOS, files may belong to root or another user.\n"
+                        "     Fix       : Run the updater with elevated privileges (Administrator / sudo).\n"
+                        "     Fix       : Ensure the target directory is writable by your account.",
+                        target=final_path, os_error=_errno(e)
 
-                    staging = final_path.with_suffix(final_path.suffix + ".updating")
+                    )
 
+                except OSError as e:
+
+                    if _is_enospace(e):
+                        fatal(...)
+
+                    elif _errno(e) in (errno.ENOENT, errno.ENOTDIR):
+                        fatal(...)
+
+                    else:
+                        self._fail_install("Atomic Replace")
+                        error_report(e)
+
+                        try:
+                            if self.backed_up and self.backup and Path(self.backup).exists():
+                                if self._recover_backup():
+                                    output("Rollback successful: old file restored from backup.")
+                                    return False
+                        except Exception:
+                            pass
+
+                        fatal(
+                            EXIT_ATOMIC,
+                            "Atomic replace failed and rollback unsuccessful.\n\n"
+                            "     Info      : A rollback was attempted after atomic replace failure, but it also failed.\n"
+                            "     Info      : This may leave your server jar in a corrupted state.\n"
+                            "     Fix       : Restore from a backup if available.\n"
+                            "     Fix       : Ensure permissions and free space are adequate before retrying.",
+                            target=final_path, os_error=None
+                        )
+
+            else:
+
+                output(f"# Moving download data to target location (staged replace): {final_path}")
+
+                staging = final_path.with_suffix(final_path.suffix + ".updating")
+
+                try:
                     shutil.copyfile(file_path, staging)
+
+                except PermissionError as e:
+
+                    fatal(
+                        EXIT_PERM,
+                        "Permission denied while staging new file.\n\n"
+                        "     Info      : The updater attempted to write a temporary file but lacked permission.\n"
+                        "     Info      : This commonly occurs when the user does not own the directory.\n"
+                        "     Fix       : Run as Administrator (Windows) or with sudo (Linux/macOS).\n"
+                        "     Fix       : Ensure the staging directory is writable.",
+                        target=staging, os_error=_errno(e)
+                    )
+
+                except OSError as e:
+
+                    if _is_enospace(e):
+
+                        fatal(
+
+                            EXIT_NOSPACE,
+                            f"Not enough disk space at target '{target_dir}'.\n\n"
+                            "     Info      : Updates require space for the new JAR plus a backup copy.\n"
+                            "     Info      : Temporary files may also consume additional disk space.\n"
+                            "     Fix       : Free up at least 1–2 GB of storage on the target drive.\n"
+                            "     Fix       : Move or delete large files before retrying.",
+                            target=staging, os_error=_errno(e)
+
+                        )
+
+                    elif _errno(e) in (errno.ENOENT, errno.ENOTDIR):
+
+                        fatal(
+                            EXIT_BAD_PATH,
+                            "Invalid path or directory while staging new file.\n\n"
+                            "     Info      : The temporary staging path could not be created or written to.\n"
+                            "     Info      : This usually means the path does not exist or is malformed.\n"
+                            "     Fix       : Verify the directory structure exists.\n"
+                            "     Fix       : Retry with a valid installation path.",
+                            target=staging, os_error=_errno(e)
+                        )
+
+                    else:
+
+                        self._fail_install("Staging New File")
+
+                        error_report(e)
+
+                        try:
+
+                            if self.backed_up and self.backup and Path(self.backup).exists():
+
+                                if self._recover_backup():
+
+                                    output("Rollback successful: old file restored from backup.")
+
+                                    return False
+
+                        except Exception:
+
+                            pass
+
+                        fatal(
+
+                            EXIT_ATOMIC,
+                            "Atomic replace failed and rollback unsuccessful.\n\n"
+                            "     Info      : The updater attempted to atomically replace the target jar, but both replace\n"
+                            "                 and rollback operations failed.\n"
+                            "     Fix       : Ensure no other processes are locking the file.\n"
+                            "     Fix       : Retry with elevated permissions.",
+                            target=final_path, os_error=None
+
+                        )
+
+                try:
 
                     os.replace(staging, final_path)
 
-            except Exception as e:
+                except PermissionError as e:
 
-                self._fail_install("File Move")
+                    fatal(
 
-                error_report(e)
+                        EXIT_PERM,
+                        "Permission denied during atomic replace.\n\n"
+                        "     Info      : The final replace step was blocked by insufficient privileges.\n"
+                        "     Info      : This can happen if the target directory belongs to another user.\n"
+                        "     Fix       : Run the updater with Administrator/sudo privileges.\n"
+                        "     Fix       : Ensure your account has write access to the directory.",
+                        target=final_path, os_error=_errno(e)
 
-                if not self.interactive and backup and self.path.is_file() and not new:
+                    )
 
-                    self._recover_backup()
+                except OSError as e:
 
-                return False
+                    if _is_enospace(e):
+
+                        fatal(
+
+                            EXIT_NOSPACE,
+                            "Not enough disk space during atomic replace.\n\n"
+                            "     Info      : The target disk ran out of space while writing the updated jar.\n"
+                            "     Info      : Both the new file and a backup copy require available space.\n"
+                            "     Fix       : Free 1–2 GB of space on the drive.\n"
+                            "     Fix       : Delete or move large files before retrying.",
+                            target=final_path, os_error=_errno(e)
+
+                        )
+
+                    elif _errno(e) in (errno.ENOENT, errno.ENOTDIR):
+
+                        fatal(
+
+                            EXIT_BAD_PATH,
+                            "Invalid path or directory during atomic replace.\n\n"
+                            "     Info      : The updater attempted to replace the jar but the target directory was invalid.\n"
+                            "     Info      : This may occur if the path is malformed or missing.\n"
+                            "     Fix       : Ensure the target directory exists.\n"
+                            "     Fix       : Retry with a valid installation path.",
+                            target=final_path, os_error=_errno(e)
+
+                        )
+
+                    else:
+
+                        self._fail_install("Atomic Replace")
+
+                        error_report(e)
+
+                        try:
+
+                            if self.backed_up and self.backup and Path(self.backup).exists():
+
+                                if self._recover_backup():
+
+                                    output("Rollback successful: old file restored from backup.")
+
+                                    return False
+
+                        except Exception:
+
+                            pass
+
+                        fatal(
+
+                            EXIT_ATOMIC,
+                            "Atomic replace failed and rollback unsuccessful.\n\n"
+                            "     Info      : A rollback was attempted after atomic replace failure, but it also failed.\n"
+                            "     Info      : This may leave your server jar in a corrupted state.\n"
+                            "     Fix       : Restore from a backup if available.\n"
+                            "     Fix       : Ensure permissions and free space are adequate before retrying.",
+                            target=final_path, os_error=None
+
+                        )
 
         output("# Done moving download data to target location!")
 
-        if not args.upgrade:
-
-            output("\n[ --== Moving Files Complete! ==-- ]")
+        output("\n[ --== Moving Files Complete! ==-- ]")
 
         return True
 
 
+    def create_backup(self) -> Optional[Path]:
+        """
+        Copy the current jar to a temp location for safe rollback.
+        Records the backup path and marks the backup as valid.
+        Returns the backup Path or None if the copy fails.
+        Emits a status line indicating where the backup resides.
+        """
+
+        self.backup = None
+
+        self.backed_up = False
+
+        if not self.path.is_file():
+
+            return None
+
+        if getattr(self, "temp", None) is None:
+
+            self.create_temp_dir()
+
+        backup_path = Path(self.temp.name) / 'backup'
+
+        try:
+
+            shutil.copyfile(self.path, backup_path)
+
+            self.backup = backup_path
+
+            self.backed_up = True
+
+            self.target_path = str(self.path)
+
+            output(f"# Backup created at: {backup_path}")
+
+            return backup_path
+
+        except Exception as e:
+
+            self._fail_install("File Backup")
+
+            error_report(e)
+
+            return None
+
+
     def _recover_backup(self):
         """
-        Attempts to recover the backup of the old server jar file.
+        Attempt to restore the original jar after install failure.
+        Deletes a corrupted target and copies the backup into place.
+        Prints step-by-step status, including unrecoverable errors.
+        Returns True on success; False if recovery could not complete.
         """
 
-        print("+=================================================+")
-        print("\n> !ATTENTION! <")
-        print("A failure has occurred during the downloading process.")
-        print("I'm sure you can see the error information above.")
-        print("This script will attempt to recover your old file.")
-        print("If this operation fails, check the github page for more info: "
+        if not (self.backed_up and self.backup and Path(self.backup).exists()):
+
+            output("# No valid backup available for recovery.")
+
+            return False
+
+        output("\nx=================================================x\n")
+        output("\n> !ATTENTION! <")
+        output("A failure has occurred during the downloading process.")
+        output("I'm sure you can see the error information above.")
+        output("This script will attempt to recover your old file.")
+        output("If this operation fails, check the github page for more info: "
               "https://github.com/Creeper36/PaperMC-Update")
-
-        # Deleting file in root directory:
-
-        print("# Deleting Corrupted temporary File...")
+        output("# Deleting Corrupted temporary File...")
 
         try:
 
@@ -1310,71 +1821,77 @@ class FileUtil:
 
         except FileNotFoundError:
 
-            # File was not found. Continuing...
-
-            print("# File not found. Continuing operation...")
+            output("# File not found. Continuing operation...")
 
         except Exception as e:
 
-            print("# Critical error during recovery process!")
-            print("# Displaying error information:")
+            output("# Critical error during recovery process!")
+            output("# Displaying error information:")
 
             error_report(e)
 
-            print("Your previous file could not be recovered.")
+            output("Your previous file could not be recovered.")
 
             return False
 
-        # Copying file to root directory:
-
-        print("# Copying backup file[{}] to server root directory[{}]...".format(Path(self.temp.name) / 'backup'),
-                                                                                 self.path)
+        output("# Copying backup file [{}] to server root directory [{}]...".format(self.backup, self.path))
 
         try:
 
-            shutil.copyfile(Path(self.temp.name) / 'backup', self.path)
+            shutil.copyfile(self.backup, self.path)
 
         except Exception as e:
 
-            print("# Critical error during recovery process!")
-            print("# Displaying error information:")
+            output("# Critical error during recovery process!")
+            output("# Displaying error information:")
 
             error_report(e)
 
-            print("Your previous file could not be recovered.")
+            output("Your previous file could not be recovered.")
 
             return False
 
-        print("\nRecovery process complete!")
-        print("Your file has been successfully recovered.")
-        print("Please debug the situation, and figure out why the problem occurred,")
-        print("Before re-trying the update process.")
+        output("\nRecovery Process Complete!")
+        output("Your file has been successfully recovered.")
+        output("Please debug the situation, and figure out why the problem occurred,")
+        output("Before re-trying the update process.")
 
         return True
 
+
     def _fail_install(self, point):
         """
-        Shows where the error occurred during the download.
-
-        :param point: Point of failure
+        Announce an installation failure banner with context.
+        Identifies the failing point to aid subsequent debugging.
+        Compliments error_report() for full exception visibility.
+        Does not terminate; caller decides on rollback or fatal().
         """
 
-        print("\n+=================================================+")
-        print("> !ATTENTION! <")
-        print("An error occurred during the download, and we can not continue.")
-        print("We will attempt to recover your previous file (If applicable)")
-        print("Fail point: {}".format(point))
-        print("Detailed error info below:")
+        output("\nx=================================================x\n")
+        output("> !ATTENTION! <")
+        output("An error occurred during the download, and we can not continue.")
+        output("We will attempt to recover your previous file (If applicable)")
+        output("Fail point: {}".format(point))
+        output("Detailed error info below:")
 
         return
 
 
 class ServerUpdater:
     """
-    Class that binds all server updater classes together
+    High-level orchestrator for selection, download, and install.
+    Bridges CLI flags to Update/FileUtil with guardrails and logs.
+    Provides interactive and non-interactive flows consistently.
+    Surfaces clear status, errors, and exit codes to the user.
     """
 
-    def __init__(self, path, config_file: str='', version='0', build=-1, config=True, prompt=True, integrity=True, user_agent: str = ''):
+    def __init__(self, path, config_file: Optional[str] = None, version='0', build=-1, config=True, prompt=True, integrity=True, user_agent: str = ''):
+        """
+        Bind target paths, flags, and shared Update/FileUtil instances.
+        Accept explicit version/build or defer to config/interactive.
+        Supports custom UA and integrity toggles for policy compliance.
+        Prepares state for subsequent check/select/download steps.
+        """
 
         self.version = version  # Version of minecraft server we are running
 
@@ -1398,7 +1915,10 @@ class ServerUpdater:
 
     def start(self):
         """
-        Starts the object, loads configuration.
+        Initialize display values from config or provided overrides.
+        Establish defaults used by selection and status routines.
+        Output a concise summary of current version/build context.
+        Does not perform network access or file mutation here.
         """
 
         temp_version = '0'
@@ -1445,8 +1965,12 @@ class ServerUpdater:
 
     def report_version(self, version=None, build=None):
         """
-        Outputs the current server version and build to the terminal.
+        Print a standardized summary of version/build identifiers.
+        Accepts overrides; otherwise uses the updater’s current state.
+        Keeps output consistent for logs and human inspection.
+        Lightweight helper called by initialization and views.
         """
+
         v = self.version if version is None else version
 
         b = self.buildnum if build is None else build
@@ -1460,93 +1984,383 @@ class ServerUpdater:
 
     def view_data(self):
         """
-        Displays data on the selected version and build.
-
-        We display the version, build, time,
-        commit changes, filename, and the sha256 hash.
-
-        Unlike version_select(), this bypasses interactive
-        prompts and the 'Version Selection' banner so that
-        --stats runs cleanly and only prints stats.
+        Present a diagnostic snapshot: local config vs remote artifact.
+        Includes API base, latency, size, SHA256, commits, and paths.
+        Performs disk-space checks and local JAR introspection.
+        Designed for --stats to preflight before any install action.
         """
+
+        def out_i(level: int, text: str = "", _BASE: int = 3, _UNIT: int = 4):
+        
+            output((" " * (_BASE + _UNIT * level)) + text)
+
+        def section(title: str):
+
+            out_i(0, title)
+
+        out_i(0, "\n[ --== PaperMC Server Stats ==-- ]\n\n")
+
+        try:
+
+            local_version, local_build = self.fileutil.load_config(self.config_file)
+
+        except Exception as e:
+
+            self._url_report("API Fetch Operation")
+
+            error_report(e, net=isinstance(e, URLError))
+
+            local_version, local_build = ("unknown", -1)
+
+        section("\nServer Version (Local Config)")
+
+        out_i(1, f"Version: {local_version}")
+
+        out_i(1, f"Build:   {local_build}")
+
+        cfg_guess = (self.fileutil.path / self.fileutil.config_default) if self.fileutil.path.is_dir() else (self.fileutil.path.parent / self.fileutil.config_default)
+
+        out_i(1, f"Config:  {cfg_guess}")
+
+        api_base = None
+
+        remote_name = None
+
+        remote_sha  = None
+
+        remote_size = None
+
+        remote_time = None
+
+        selected_build = local_build
+
+        commits = []
+
+        newer_version_line = "none"
+
+        latency_ms = None
 
         try:
 
             versions = self.update.get_versions()
 
+            if local_version in ("unknown", "0") and versions:
+
+                local_version = versions[-1]  # fallback to oldest if unknown, just to proceed
+
+            newest_ver = versions[-1] if versions else None
+
+            if newest_ver and newest_ver != local_version:
+
+                newer_version_line = f"{newest_ver} (you are on {local_version})"
+
+            if not isinstance(local_build, int) or local_build <= 0:
+
+                builds = self.update.get_buildnums(local_version)
+
+                selected_build = max(builds) if builds else -1
+
+            t0 = time.perf_counter()
+
+            data = self.update.decode_json_metadata(local_version, selected_build)
+
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+
+            api_base = self.update._base
+
+            downloads = data.get("downloads", {})
+
+            dflt = downloads.get("server:default") or downloads.get("application", {})
+
+            remote_name = dflt.get("name")
+
+            remote_sha  = (dflt.get("checksums") or {}).get("sha256")
+
+            remote_size = int(dflt.get("size") or 0)        
+
+            remote_time = data.get('time', 'unknown')
+
+            commits = data.get("commits") or data.get("changes", []) or []
+
+            builds_for_status = self.update.get_buildnums(local_version)
+
+            latest_build = max(builds_for_status) if builds_for_status else selected_build
+
+            if isinstance(local_build, int) and local_build >= latest_build:
+
+                status_line = "UP-TO-DATE"
+
+            else:
+
+                behind = (latest_build - (local_build if isinstance(local_build, int) else 0)) if (isinstance(latest_build, int) and isinstance(local_build, int) and local_build > 0) else "unknown"
+
+                status_line = f"BEHIND (latest build: {latest_build}, behind by {behind})"
+
+            section("\nUpdate Status")
+
+            out_i(1, f"Current: {status_line}")
+
+            out_i(1, f"Newer game version: {newer_version_line}")
+
+            section("\nRemote Artifact (PaperMC)")
+
+            out_i(1, f"Project: paper   API: {api_base}")
+
+            if latency_ms is not None:
+
+                out_i(1, f"API latency: {latency_ms} ms")
+
+            latest_tag = " (latest)" if (selected_build != local_build and selected_build != -1 and selected_build == latest_build) else ""
+
+            out_i(1, f"Version/Build: {local_version} / {selected_build}{latest_tag}")
+
+            out_i(1, f"File: {remote_name}")
+
+            out_i(1, f"Created: {remote_time}")
+
+            out_i(1, f"Size: { (remote_size or 0) / (1024*1024):.2f} MiB")
+
+            out_i(1, f"SHA256: {remote_sha}")
+
+            if commits:
+
+                section("\nRecent Commits (top 5)")
+
+                for i, c in enumerate(commits[:5], 1):
+
+                    sha7 = c.get("sha") or c.get("commit", "")
+
+                    sha7 = sha7[:7]
+
+                    ctime = c.get("time", "?")
+
+                    summary = c.get("summary") or c.get("message", "")
+
+                    msg = (summary or "").strip().splitlines()[0]
+
+                    out_i(1, f"{i}) {sha7}  {ctime}  {msg}")
+
         except Exception as e:
 
             self._url_report("API Fetch Operation")
 
             error_report(e, net=isinstance(e, URLError))
 
-            return
+        section("\nPaths & Space (Preview)")
 
-        ver = self._select(args.version, versions, 'latest', 'version', print_output=False)
+        tmp_preview = Path(tempfile.gettempdir()) / f"paper_update_tmp"
 
-        if not ver:
+        out_i(1, f"Temp dir:   {tmp_preview}")
 
-            return
+        target_dir = self.fileutil.path if self.fileutil.path.is_dir() else self.fileutil.path.parent
+
+        out_i(1, f"Target dir: {target_dir}")
+
+        if args.output:
+
+            target_file = (target_dir / args.output)
+
+        elif self.fileutil.path.is_file():
+
+            target_file = self.fileutil.path
+
+        else:
+
+            target_file = (target_dir / (remote_name if remote_name else "paper.jar"))
+
+        out_i(1, f"Target file: {target_file}   (--output honored)")
 
         try:
 
-            builds = list(self.update.get_buildnums(ver))
+            du = shutil.disk_usage(str(target_dir))
+
+            free_gib, total_gib = du.free/(1024**3), du.total/(1024**3)
+
+            out_i(1, f"Disk free @ target: {free_gib:.1f} GiB free / {total_gib:.1f} GiB total")
+
+            need = (remote_size or 0) * 2   # Require 2x buffer (new + backup)
+
+            if du.free < need:
+
+                fatal(
+
+                    EXIT_NOSPACE,
+                    f"Insufficient disk space at {target_dir}. "
+                    f"Free: {human_readable_size(du.free)}, "
+                    f"Need: {human_readable_size(need)}"
+
+                )
+
+            else:
+
+                out_i(1, f"Space check: need ~{((remote_size or 0)/(1024*1024)):.2f} MiB "
+
+                         f"(buffer x2 = {(need/(1024*1024)):.2f} MiB) → OK")
+
+        except Exception:
+
+            pass
+
+        writable = os.access(str(target_dir), os.W_OK)
+
+        out_i(1, f"Writable: {'YES' if writable else 'NO'}")
+
+        section("\nLocal File (Actual)")
+
+        jar_path = None
+
+        try:
+
+            if args.path.is_file():
+
+                jar_path = args.path
+
+            elif args.path.is_dir():
+
+                candidate = (args.path / remote_name) if remote_name else None
+
+                if candidate and candidate.is_file():
+
+                    jar_path = candidate
+
+                else:
+
+                    jars = sorted((p for p in args.path.glob('*.jar')), key=lambda p: p.stat().st_mtime, reverse=True)
+
+                    paper_jars = [p for p in jars if p.name.lower().startswith("paper-")]
+
+                    jar_path = (paper_jars[0] if paper_jars else (jars[0] if jars else None))
+
+            if jar_path and jar_path.is_file():
+
+                with open(jar_path, "rb") as f:
+
+                    local_sha = sha256(f.read()).hexdigest()
+
+                st = jar_path.stat()
+
+                import datetime as _dt
+
+                out_i(1, f"Path:  {jar_path}")
+
+                out_i(1, f"Size:  {st.st_size/(1024*1024):.2f} MiB")
+
+                out_i(1, f"MTime: {_dt.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M:%S')}")
+
+                out_i(1, f"SHA256: {local_sha}")
+
+                if remote_sha:
+
+                    note = "MATCH" if local_sha.lower() == remote_sha.lower() else "MISMATCH"
+
+                    out_i(1, f"Compare: local vs remote SHA: {note}")
+
+                    if remote_size:
+
+                        delta = (st.st_size - remote_size)/(1024*1024)
+
+                        out_i(1, f"Size delta: {delta:+.2f} MiB")
+
+            else:
+
+                out_i(1, "Local file not found; unable to compute SHA256.")
 
         except Exception as e:
 
-            self._url_report("API Fetch Operation")
+            error_report(e)
 
-            error_report(e, net=isinstance(e, URLError))
+        section("\nPlugins Snapshot")
 
-            return
+        try:
 
-        if not builds:
+            plug_dir = (args.path if args.path.is_dir() else args.path.parent) / "plugins"
 
-            print("# No builds available for version", ver)
+            if plug_dir.is_dir():
 
-            return
+                plugs = sorted([p.name for p in plug_dir.glob("*.jar")])
 
-        build = self._select(args.build, builds, -1, 'buildnum', print_output=False)
+                out_i(1, f"Count: {len(plugs)}")
 
-        if not build:
+                if plugs:
 
-            return
+                    display = ", ".join(plugs[:7]) + ("..." if len(plugs) > 7 else "")
 
-        # Get the data
+                    out_i(1, display)
 
-        data = self.update.get(ver, build)
+            else:
 
-        output("\n+=================================================+")
-        output("\n[ --== Paper Stats: ==-- ]\n")
-        output(f"Version: {ver}")
-        output(f"Build Number: {build}")
-        output(f"Creation Time: {data['time']}")
-        output(f"File name: {data['downloads']['server:default']['name']}")
-        output(f"SHA256 Hash: {data['downloads']['server:default']['checksums']['sha256']}")
+                out_i(1, "No plugins directory found.")
 
-        for num, change in enumerate(data['commits']):
-            output("\nChange {}:\n".format(num))
-            output("Commit ID: {}".format(change['sha']))
-            output("Commit Time: {}".format(change['time']))
-            output("Commit Message: {}".format(change['message']))
+        except Exception:
 
-        output("\n[ --== End Paper Stats! ==-- ]\n")
-        output("+=================================================+\n")
+            pass
+
+        section("\nEnvironment")
+
+        try:
+
+            out_i(1, f"OS: {platform.system()} {platform.release()}")
+
+            out_i(1, f"Python: {platform.python_version()} ({platform.machine()})")
+
+            ua = self.update._headers.get('User-Agent', '')
+
+            if ua: out_i(1, f"HTTP UA: {ua}")
+
+            import shutil as _sh
+
+            java_path = _sh.which("java")
+
+            if java_path:
+
+                try:
+
+                    proc = subprocess.run(["java", "-version"], capture_output=True, text=True)
+
+                    jver = (proc.stderr or proc.stdout).strip().splitlines()[0]
+
+                    out_i(1, f"Java: {jver}")
+
+                except Exception:
+
+                    pass
+
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+            s.settimeout(2.0)
+
+            try:
+
+                s.connect(("127.0.0.1", 25565))
+
+                out_i(1, "Port 25565 (localhost): OPEN")
+
+            except Exception:
+
+                out_i(1, "Port 25565 (localhost): closed")
+
+            finally:
+
+                try: s.close()
+
+                except Exception: pass
+
+        except Exception:
+
+            pass
+
+        output("\n\n+===================================END-OF-STATS===================================+\n\n")
+
 
     def check(self, default_version: str, default_build: int):
         """
-        Checks if a new version is available.
-
-        :param default_version: Default version to move
-        :type default_version: str
-        :param default_build: Default build to move
-        :type default_build: int
-        :return: True is new version, False if not/error
+        Compare local state to remote latest and report deltas.
+        Evaluates both version and build, handling unknown locals.
+        Returns True if an update is available, False otherwise.
+        Gracefully maps API failures to error reporting without fatal().
         """
 
         output("\n[ --== Checking For New Version: ==-- ]\n")
-
-        # Checking for new server version
 
         output("# Loading version information ...")
 
@@ -1558,8 +2372,6 @@ class ServerUpdater:
 
             self._url_report("API Fetch Operation")
 
-            # Report the error
-
             error_report(e, net=True)
 
             return False
@@ -1567,8 +2379,6 @@ class ServerUpdater:
         except Exception as e:
 
             self._url_report("API Fetch Operation")
-
-            # Report the error
 
             error_report(e)
 
@@ -1578,28 +2388,23 @@ class ServerUpdater:
 
         if self.version != self._select(default_version, ver, 'latest', 'version', print_output=False) and (self.version == '0' or ver[-1] != self.version):
 
-            # New version available!
-
             output("# New Version available! - [Version: {}]".format(ver[-1]))
-            output("\n[ --== Version check complete! ==-- ]")
+            output("\n[ --== Version Check Complete! ==-- ]")
 
             return True
 
         output("# No new version available.")
-
-        # Checking builds
-
         output("# Loading build information ...")
+
+        builds = []
 
         try:
 
-            build = self.update.get_buildnums(self.version)
+            builds = self.update.get_buildnums(self.version)
 
         except URLError as e:
 
             self._url_report("File Download")
-
-            # Report the error
 
             error_report(e, net=True)
 
@@ -1609,58 +2414,44 @@ class ServerUpdater:
 
             self._url_report("File Download")
 
-            # Report the error
-
             error_report(e)
 
             return False
 
         output("# Comparing local <> remote builds ...")
 
-        if self.buildnum != self._select(default_build, build, 'latest', 'buildnum', print_output=False) and (self.buildnum == 0 or build[-1] != self.buildnum):
+        if builds and self.buildnum != self._select(default_build, builds, 'latest', 'buildnum', print_output=False) and (self.buildnum == 0 or builds[-1] != self.buildnum):
 
-            # New build available!
-
-            output("# New build available! - [Build: {}]".format(build[-1]))
-            output("\n[ --== Version check complete! ==-- ]")
+            output("# New build available! - [Build: {}]".format(builds[-1]))
+            output("\n[ --== Version Check Complete! ==-- ]")
 
             return True
 
         output("# No new build available.")
-        output("\n[ --== Version check complete! ==-- ]")
+        output("\n[ --== Version Check Complete! ==-- ]\n")
 
         return False
 
+
     def version_select(self, default_version: str='latest', default_build: int=-1) -> Tuple[str, int]:
         """
-        Prompts the user to select a version to download,
-        and checks input against values from Paper API.
-        Default value is recommended option, usually 'latest'.
-
-        :param default_version: Default version
-        :type default_version: str
-        :param default_build: Default build number
-        :type default_build: int
-        :return: (version, build)
+        Resolve a concrete (version, build) from flags, config, or input.
+        Supports interactive prompts or silent defaults for automation.
+        Validates availability and returns normalized types (str,int).
+        Non-fatal error paths return ('', -1) to stop safely.
         """
 
         if self.version_install is not None and self.build_install is not None:
 
-            # Already have a version and build selected, return:
-
             return self.version_install, self.build_install
 
-        output("\n[ --== Version Selection: ==-- ]")
+        output("\n[ --== Version Selection: ==-- ]\n")
 
         new_default = str(default_build)
 
         if new_default == '-1':
 
-            # Convert into something more readable:
-
             new_default: str = 'latest'
-
-        # Checking if we have version information:
 
         if not self.prompt:
 
@@ -1674,8 +2465,6 @@ class ServerUpdater:
 
             self._url_report("API Fetch Operation")
 
-            # Report the error
-
             error_report(e, net=True)
 
             return '', -1
@@ -1684,30 +2473,26 @@ class ServerUpdater:
 
             self._url_report("API Fetch Operation")
 
-            # Report the error
-
             error_report(e)
 
             return '', -1
 
         if self.prompt:
 
-            print("\nPlease enter the version you would like to download:")
-            print("Example: 1.4.4")
-            print("(Tip: <DEFAULT> Option Is Enclosed In Angle Brackets <>. Press <ENTER> to accept it.)")
-            print("(Tip: Enter 'latest' to select the most recent version of paper.)")
+            output("\nPlease enter the version you would like to download:")
+            output("Example: 1.4.4")
+            output("(Tip: <DEFAULT> Option Is Enclosed In Angle Brackets <>. Press <ENTER> to accept it.)")
+            output("(Tip: Enter 'latest' to select the most recent version of paper.)")
 
-            print("\nAvailable versions:")
-
-            # Displaying available versions
+            output("\nAvailable versions:")
 
             for i in versions:
 
-                print("  Version: [{}]".format(i))
+                output("  Version: [{}]".format(i))
 
             while True:
 
-                ver = input("\nEnter Version <{}>: ".format(default_version))
+                ver = input("\nENTER VERSION (press Enter for latest available) <{}>: ".format(default_version))
 
                 ver = self._select(ver, versions, default_version, "version")
 
@@ -1717,19 +2502,13 @@ class ServerUpdater:
 
         else:
 
-            # Just select default version
-
             ver = self._select('', versions, default_version, "version")
 
             if not ver:
 
-                # Invalid version selected
-
-                print("# Aborting download!")
+                output("# Aborting download!")
 
                 return '', -1
-
-        # Getting build info
 
         output("# Loading build information ...")
 
@@ -1741,8 +2520,6 @@ class ServerUpdater:
 
             self._url_report("API Fetch Operation")
 
-            # Report the error
-
             error_report(e, net=True)
 
             return '', -1
@@ -1751,75 +2528,59 @@ class ServerUpdater:
 
             self._url_report("API Fetch Operation")
 
-            # Report the error
-
             error_report(e)
 
             return '', -1
 
-        # Check if their are no builds:
-        
         if len(nums) == 0:
             
-            # No builds available, abort:
+            output("# No builds available!")
+            output("\nThe version you have selected has no builds available.")
+            output("This could be because the version you are attempting to download is too new or old.")
+            output("The best solution is to either wait for a build to be produced for your version,")
+            output("Or select a different version instead.")
 
-            print("# No builds available!")
-            print("\nThe version you have selected has no builds available.")
-            print("This could be because the version you are attempting to download is too new or old.")
-            print("The best solution is to either wait for a build to be produced for your version,")
-            print("Or select a different version instead.")
-
-            print("\nTo see if a specific version has builds, you can issue the following command:\n")
-            print("python server_update.py -nc --version [version]")
-            print("\nSimply replace [version] with the version you wish to check.")
-            print("This message will appear again if there are still no builds available.")
-            print("The script will now exit.")
+            output("\nTo see if a specific version has builds, you can issue the following command:\n")
+            output("python server_update.py -nc --version [version]")
+            output("\nSimply replace [version] with the version you wish to check.")
+            output("This message will appear again if there are still no builds available.")
+            output("The script will now exit.")
 
             return '', -1
 
         if self.prompt:
 
-            print("\nPlease enter the build you would like to download:")
-            print("Example: 205")
-            print("(Tip: <DEFAULT> Option Is Enclosed In Angle Brackets <>. Press <ENTER> to accept it.)")
-            print("(Tip: Enter 'latest' to select the most recent build of paper.)")
+            output("\nPlease enter the build you would like to download:")
+            output("Example: 205")
+            output("(Tip: <DEFAULT> Option Is Enclosed In Angle Brackets <>. Press <ENTER> to accept it.)")
+            output("(Tip: Enter 'latest' to select the most recent build of paper.)")
 
-            print("\nAvailable Builds:")
-
-            # Displaying available builds
+            output("\nAvailable Builds:")
 
             new = []
 
             for i in sorted(nums, key=int):
 
-                print("  > Build Num: [{}]".format(i))
+                output("  > Build Num: [{}]".format(i))
+
                 new.append(str(i))
 
             while True:
 
-                # Prompting user for build info
+                build = input("\nENTER BUILD (press Enter for latest available) <{}>: ".format(new_default))
 
-                build = input("\nEnter Build <{}>: ".format(new_default))
-
-                print(new_default)
 
                 build = self._select(build, new, new_default, "build")
 
                 if build:
-
-                    # User selected okay value
  
                     break
 
         else:
 
-            # Select default build
-
             build = self._select('', nums, new_default, "build")
 
             if not build:
-
-                # Invalid build selected!
 
                 output("# Aborting download!")
 
@@ -1829,9 +2590,7 @@ class ServerUpdater:
         output("   > Version: [{}]".format(ver))
         output("   > Build: [{}]".format(build))
 
-        output("\n[ --== Version Selection Complete! ==-- ]")
-
-        # Setting our values:
+        output("\n[ --== Version Selection Complete! ==-- ]\n")
 
         self.version_install = str(ver)
 
@@ -1842,61 +2601,77 @@ class ServerUpdater:
     def get_new(self, default_version: str='latest', default_build: int=-1, backup: bool=True, new: bool=False, 
             target_copy: str=None, output_name: str=None):
         """
-        Downloads the new version,
-        Prompts the user to select a specific version.
-
-        After the version is selected,
-        then we invoke the process of downloading the the file,
-        and moving it to the current location.
-
-        :param default_version: Default version to select if none is specified
-        :type default_version: str
-        :param default_build: Default build to select if none is specified
-        :type default_build: str
-        :param backup: Value determining if we should back up the old jar file
-        :type backup: bool
-        :param new: Value determining if we are doing a new download
-        :type new: bool
-        :param target_copy: Path we should copy the old file to
-        :type no_delete: str
-        :param output_name: Name of the new file. None to keep original name
-        :type output_name: str
+        Download, verify, and install the selected Paper artifact.
+        Honors backup/rename settings and integrity verification.
+        Emits user-friendly progress and completes with a clear status.
+        Updates internal version/build on success and returns truthy.
         """
-
-        # Prompting user for version info:
 
         ver, build = self.version_select(default_version=default_version, default_build=default_build)
 
         if ver == '' or build == -1:
 
-            # Error occurred, cancel download
-
             return
-
-        # Checking if user wants to continue with download
 
         if self.prompt:
 
-            print("\nDo you want to continue with the download?")
+            output("\n# Do you want to continue with the download?")
 
-            inp = input("(Y/N):").lower()
+            inp = input("#  (Y/N):").lower()
 
             if inp in ['n', 'no']:
-                # User does not want to continue, exit
 
-                output("Canceling download...")
+                output("\nCanceling download...\n")
 
                 return
 
-        # Creating temporary directory to store assets:
 
-        output("\n# Creating temporary directory...")
+        try:
+
+            data = self.update.decode_json_metadata(ver, build)
+
+        except Exception as e:
+
+            self._url_report("API Fetch Operation")
+
+            error_report(e, net=isinstance(e, URLError))
+
+            return False
+
+        downloads = data.get("downloads", {})
+
+        dflt = downloads.get("server:default") or downloads.get("application", {})
+
+        expected_hash = str((dflt.get("checksums") or {}).get("sha256", ""))
+
+        if expected_hash:
+
+            eh = expected_hash.lower()
+
+            if len(eh) != 64 or any(c not in "0123456789abcdef" for c in eh):
+
+                fatal(
+
+                    EXIT_INTEGRITY,
+                    "Malformed SHA-256 from API (must be 64 hex chars).\n\n"
+                    "     Info      : The PaperMC API returned a SHA-256 value that is not valid.\n"
+                    "     Info      : This is usually a server-side API bug or corrupted metadata.\n"
+                    "     Fix       : Retry later once the API metadata has been corrected.\n"
+                    "     Fix       : Report the issue if it persists at https://papermc.io/.",
+
+                )
+
+            if args.interactive:
+
+                output("")
+
+            output(f"# Remote File Found! -- SHA256 Ending in: {expected_hash[-10:]}")
+
+        output("# Creating temporary directory...")
 
         self.fileutil.create_temp_dir()
 
         output("# Temporary directory created at: {}".format(self.fileutil.temp.name))
-
-        # Starting download process:
 
         if not args.batch:
 
@@ -1904,7 +2679,7 @@ class ServerUpdater:
 
         if args.batch:
 
-            output("# Starting download...")
+            output("# Starting Download...")
 
         try:
 
@@ -1914,41 +2689,28 @@ class ServerUpdater:
 
             self._url_report("File Download")
 
-            # Report the error
-
             error_report(e, net=True)
 
-            return False
+            fatal(
 
-        except ValueError as e:
+                EXIT_NET_DL,
+                "Network error while downloading Paper jar.\n\n"
+                "     Info      : The updater attempted to download the latest Paper jar but the transfer failed.\n"
+                "     Info      : Causes may include timeouts, dropped connections, or server-side issues.\n"
+                "     Fix       : Verify your internet connection is stable.\n"
+                "     Fix       : Retry later, or check if PaperMC servers are experiencing downtime.",
+                target=str(self.fileutil.path), os_error=None
 
-            print("\n+=================================================+")
-            print("> !ATTENTION! <")
-            print("The file integrity check failed!")
-            print("This means that the file downloaded is corrupted or damaged in some way.")
-            print("Your current file (if one is targeted) has not been altered.")
-            print("\nThere are many different causes for this error to occur.")
-            print("It is likely that this is a one-off event.")
-            print("Try again, and if this command continues to fail,")
-            print("then your network or storage device might have a problem.")
+            )
 
-            error_report(e)
-
-            return False
 
         except Exception as e:
 
             self._url_report("File Download")
 
-            # Report the error
-
             error_report(e)
 
             return False
-
-        if self.integrity:
-
-            output("# Integrity test passed!")
 
         output("# Saved file to: {}".format(path))
 
@@ -1958,57 +2720,85 @@ class ServerUpdater:
 
         if args.batch:
 
-            output("# Download complete!")
-
-        # Determining output name:
+            output("# Download Complete!")
 
         target = self.fileutil.path
 
-        # No output name defined via argument or path:
+        if self.fileutil.path.is_dir():
 
-        if output_name is None and self.fileutil.path.is_dir():
+            if output_name:
 
-            # Keep original name:
+                target = self.fileutil.path / output_name
 
-            target = self.fileutil.path / path.name
+            else:
 
-        # Output name specified via argument but not path:
+                target = self.fileutil.path / f"paper-{ver}-{build}.jar"
 
-        elif output_name is not None and self.fileutil.path.is_dir():
+        elif self.fileutil.path.exists() and self.fileutil.path.is_file() and self.fileutil.path.suffix.lower() == ".jar":
 
-            # Save file with custom name:
+            target = self.fileutil.path
 
-            target = self.fileutil.path / output_name
+        elif not self.fileutil.path.exists() and output_name is None:
 
-        # Output name specified via argument and path:
+            if not self.fileutil.path.parent.exists():
 
-        elif output_name is not None and self.fileutil.path.is_file():
+                fatal(
 
-            # Save file with custom name other than filename in path:
+                    EXIT_BAD_PATH,
+                    f"Invalid target path: '{self.fileutil.path}'.\n\n"
+                    "     Info      : The folder does not exist, the path string is malformed, or the location is not writable.\n"
+                    "     Info      : This error often happens if you misspell the directory name, or pass only a filename without a folder.\n"
+                    "     Fix       : Create the folder manually before running the updater.\n"
+                    "     Fix       : Use -o [filename] if you want to name the output jar explicitly inside an existing folder.\n"
+
+                )
+
+            if self.fileutil.path.parent == Path(self.fileutil.path.anchor):
+
+                fatal(
+
+                    EXIT_BAD_ROOT,
+                    f"Root directory installs are not allowed: '{self.fileutil.path}'.\n\n"
+                    "     Info      : Installing directly into the root of a drive (C:\\ on Windows, / on Linux/Unix) is unsafe.\n"
+                    "     Info      : Backups and rollbacks cannot be managed properly at root, and permission errors are very likely.\n"
+                    "     Fix       : Always choose a subfolder dedicated to Minecraft (e.g., C:\\Minecraft\\ or ~/minecraft/).\n"
+                    "     Fix       : Move your server files into a proper folder and re-run the updater.\n"
+
+                )
+
+            target = self.fileutil.path
+
+        elif output_name:
 
             target = self.fileutil.path.parent / output_name
 
-        # Downloading file:
+        else:
+
+            fatal(
+
+                EXIT_BAD_PATH,
+                f"Invalid target path '{self.fileutil.path}'.\n\n"
+                "     Info      : The updater was given a path that is not valid.\n"
+                "     Info      : The path must either be a directory or end in .jar.\n"
+                "     Fix       : Ensure the folder exists and is writable.\n"
+                "     Fix       : Use -o [filename] to set a custom jar name if needed.",
+                target=str(self.fileutil.path), os_error=None
+
+            )
 
         val = self.fileutil.install(path, target, backup=backup, new=new, target_copy=target_copy)
 
         if not val:
 
-            # Download process failed
-
             return
 
-        # Cleaning up temporary directory:
-
-        output("\n# Cleaning up temporary directory...")
+        output("\n# Cleaning Up Temporary Directory...")
 
         self.fileutil.close_temp_dir()
 
-        output("# Done cleaning temporary directory!")
+        output("# Done Cleaning Temporary Directory!")
 
-        output("\n# Update complete!")
-
-        # Updating values
+        output("\n# Update Complete!\n")
 
         self.version = ver
 
@@ -2019,27 +2809,19 @@ class ServerUpdater:
 
     def _select(self, val, choice, default, name, print_output=True):
         """
-        Select a value from choices.
-        Special values:
-          - '', uses default
-          - -1 or 'latest', picks newest automatically
-          - 'current', uses currently installed version/build
-        Robust to string/int mismatches and list ordering.
+        Normalize “latest/current/value” against a candidate list.
+        Coerces types, validates membership, and logs selections.
+        Supports numeric and string lists for builds and versions.
+        Returns the chosen value or None on invalid input.
         """
-
-        # Normalize blank -> default
 
         if val == '':
 
             val = default
 
-        # Normalize numeric sentinel for latest
-
         if val == -1:
 
             val = 'latest'
-
-        # Normalize strings
 
         if isinstance(val, str):
 
@@ -2055,13 +2837,9 @@ class ServerUpdater:
 
             else:
 
-                # If choices are ints and user typed digits, coerce
-
                 if choice and isinstance(choice[0], int) and s.isdigit():
 
                     val = int(s)
-
-        # Handle “latest”
 
         if val == 'latest':
 
@@ -2073,11 +2851,7 @@ class ServerUpdater:
 
                 return None
 
-            # If this is build selection, take the numeric max (most robust).
-
             if name in ('build', 'buildnum'):
-
-                # Coerce to ints if needed
 
                 if isinstance(choice[0], str):
 
@@ -2086,8 +2860,6 @@ class ServerUpdater:
                         nums = [int(x) for x in choice]
 
                     except ValueError:
-
-                        # Fallback: keep original and rely on last element
 
                         latest = choice[-1]
 
@@ -2105,8 +2877,6 @@ class ServerUpdater:
 
                 return latest
 
-            # For versions, keep your existing “newest” behavior (last element).
-
             latest = choice[-1]
 
             if print_output:
@@ -2114,8 +2884,6 @@ class ServerUpdater:
                 output(f"# Selecting latest {name} - [{latest}] ...")
 
             return latest
-
-        # Handle “current”
 
         if val == 'current':
 
@@ -2127,8 +2895,6 @@ class ServerUpdater:
 
                 val = self.buildnum
 
-        # Coerce for membership checks
-
         if choice:
 
             if isinstance(choice[0], int) and isinstance(val, str) and val.isdigit():
@@ -2138,8 +2904,6 @@ class ServerUpdater:
             elif isinstance(choice[0], str) and not isinstance(val, str):
 
                 val = str(val)
-
-        # Validate
 
         if val not in choice:
 
@@ -2158,124 +2922,127 @@ class ServerUpdater:
 
     def _url_report(self, point: str):
         """
-        Reports an error during a request operation.
-        :param point: Point of failure
-        :type point: str
+        Print a concise header identifying the failing API stage.
+        Associates subsequent tracebacks with the intended operation.
+        Improves readability of logs in batch runs.
+        Used immediately before error_report() calls.
         """
 
-        print("\n+=================================================+")
-        print("> !ATTENTION! >")
-        print("An error occurred during a request operation.")
-        print("Fail Point: {}".format(point))
-        print("Your check/update operation will be canceled.")
-        print("Detailed error info below:")        
+        output("\nx=================================================x\n")
+        output("> !ATTENTION! >")
+        output("An error occurred during a request operation.")
+        output(f"Fail Point: {point}")
+        output("Your check/update operation will be canceled.")
+        output("Detailed error info below:")
 
 
 if __name__ == '__main__':
 
-    # Ran as script
-
     check_internet_connection()
 
-    parser = argparse.ArgumentParser(description='PaperMC Server Updater.', epilog='Please check the github page for more info: https://github.com/Creeper36/PaperMC-Update.')
+    linesep = os.linesep
+
+    parser = argparse.ArgumentParser(description=r'PaperMC Server Updater -- Typical Syntax: Python C:\minecraft\server_update.py -options C:\minecraft\paper.jar  -- should always end with paper.jar')
 
     parser.add_argument('path', help='Path to paper jar file', default=Path(__file__).expanduser().resolve().absolute().parent, type=Path, nargs='?')
-
-    version = parser.add_argument_group('Version Options', 'Arguments for selecting and altering server version information')
-
-    # +===========================================+
-    # Server version arguments:
-
-    version.add_argument('-v', '--version', help='Server version to download(Sets default value)', default='latest', type=str)
-    version.add_argument('-b', '--build', help='Server build to download(Sets default value)', default=-1, type=int)
-    version.add_argument('-iv', help='Sets the currently installed server version, ignores config', default='0', type=str)
-    version.add_argument('-ib', help='Sets the currently installed server build, ignores config', default=0, type=int)
-    version.add_argument('-sv', '--server-version', help="Displays server version from configuration file and exits", action='store_true')
-
-    # +===========================================+
-    # File command line arguments:
-
-    file = parser.add_argument_group("File Options", "Arguments for altering how we work with files")
-    file.add_argument('-nlc', '--no-load-config', help='Will not load Paper config file: version_history.json', action='store_false')
-    file.add_argument('-cf', '--config-file', help='Path to Paper config file to read from, usually version_history.json - DEFAULTS to [SERVER_JAR_DIR]/version_history.json')
-    file.add_argument('-nb', '--no-backup', help='Disables backup of the old server jar', action='store_true')
-    file.add_argument('-n', '--new', help='Downloads a new paper jar instead of updating. Great for configuring a new server install', action='store_true')
-    file.add_argument('-o', '--output', help='Name of the new file')
-    file.add_argument('-co', '--copy-old', help='Copies the old file to a new location')
-    file.add_argument('-ni', '--no-integrity', help='Skips the file integrity check', action='store_false')
-
-    # +===========================================+
-    # General command line arguments:
-
+    parser.add_argument('-v', '--version', help='[##.##.##] Manually set a server version to download (Sets default value)', default='latest', type=str)
+    parser.add_argument('-b', '--build', help='[###] Manually set a build number to download (Sets default value)', default=-1, type=int)
+    parser.add_argument('-sv', '--server-version', help="Displays the current paper server version from version-history.json.", action='store_true')
+    parser.add_argument("-V", "--script-version", help="Display this scripts version and basic contact info", action="store_true")
+    parser.add_argument('-s', '--stats', help='Displays statistics on the whole system', action='store_true')
     parser.add_argument('-c', '--check-only', help='Checks for an update, does not download', action='store_true')
-    parser.add_argument('-nc', '--no-check', help='Does not check for an update, skips to download', action='store_true')
     parser.add_argument('-i', '--interactive', help='Prompts the user for the paper.jar version they would like to download', action='store_true')
-    parser.add_argument('-q', '--quiet', help="Will only output errors and interactive questions to the terminal", action='store_true')
-    parser.add_argument('-s', '--stats', help='Displays statistics on the selected version and build', action='store_true')
+    parser.add_argument("-ua", "--user-agent", help="User agent to utilize when making requests this should be unique and custom to you! See https://mdn.io/user-agent for additional help", type=str, default='')
+    parser.add_argument('-n', '--new', help='Downloads a new paper jar - like --no-check but deals more with names and folders', action='store_true')
+    parser.add_argument('-nb', '--no-backup', help='Disables backup of the old server jar', action='store_true')
+    parser.add_argument('-ni', '--no-integrity', help='DISABLES SHA-256 verification of downloads. USE WITH CAUTION!', action='store_false')
+    parser.add_argument('-nc', '--no-check', help='Does not check for an update - like --new but deals more with numbers and version decision making', action='store_true')
+    parser.add_argument('-o', '--output', help='Specify unique output filenames even with alternate extensions')
+    parser.add_argument('-co', '--copy-old', help='Copies the old jar file to a new location')
+    parser.add_argument('-cf', '--config-file', help='Path to version_history.json - Defaults to Server JAR Folder (has many fallback searches')
+    parser.add_argument('-nlc', '--no-load-config', help='Skip loading version_history.json', action='store_false')
     parser.add_argument('-ba', '--batch', help='Log-friendly output mainly for batch scripts', action='store_true')
-    parser.add_argument('-V', '--script-version', help='Displays script version', version=__version__, action='version')
-    parser.add_argument("-ua", "--user-agent", help="User agent to utilize when making requests this should be unique and custom to you! See https://docs.papermc.io/misc/downloads-api/", type=str, default='')
+    parser.add_argument('-q', '--quiet', help="Suppress all output! -silent mode- Only exit codes will be returned.", action='store_true')
     parser.add_argument('-u', '--upgrade', help='Upgrades this script to a new version if necessary, and exits', action='store_true')
     parser.add_argument('-F', '--force-upgrade', help='Force a script upgrade even if versions match (implies --upgrade)', action='store_true')
-
-    # +===========================================+
-    # Deprecated arguments - Included for compatibility, but do nothing
-
-    parser.add_argument('-ndc', '--no-dump-config', help=argparse.SUPPRESS, action='store_false')
-    parser.add_argument('--config', help=argparse.SUPPRESS, default='NONE')
-    parser.add_argument('-C', '--cleanup', help=argparse.SUPPRESS, action='store_true')
-    parser.add_argument('-nr', '--no-rename', help=argparse.SUPPRESS)
+    rare = parser.add_argument_group('Rare Options', 'Arguments usually only used by devs or advanced users')
+    rare.add_argument('-iv', help='Sets the currently installed server version, ignores version_history.json', default='0', type=str)
+    rare.add_argument('-ib', help='Sets the currently installed server build number, ignores version_history.json', default=0, type=int)
 
     args = parser.parse_args()
 
     def _bind_output_with_args(_args):
+        """
+        Bind the global output() to current CLI flags and filters.
+        Provides a stable logging surface across the codebase.
+        Keeps presentation concerns decoupled from business logic.
+        Must be invoked once after argparse has parsed flags.
+        """
+
         global output
+
         _orig_output = output
+
         def _bound_output(text, args=None):
-            return _orig_output(text, _args if args is None else args)
+            """
+            Wrapped output implementation honoring batch/quiet modes.
+            Filters noisy lines and preserves essential diagnostics.
+            Provides a single choke point for user-visible messages.
+            Internal helper; not intended for direct external use.
+            """
+
+            return _orig_output(text)
+
         output = _bound_output
 
     _bind_output_with_args(args)
-
     
-    if not (args.batch):
+if args.server_version:
 
-        output("\n+==========================================================================+")
-        banner = dedent(r'''
-                |     _____                              __  __          __      __        |
-                |    / ___/___  ______   _____  _____   / / / /___  ____/ /___ _/ /____    |
-                |    \__ \/ _ \/ ___/ | / / _ \/ ___/  / / / / __ \/ __  / __ `/ __/ _ \   |
-                |   ___/ /  __/ /   | |/ /  __/ /     / /_/ / /_/ / /_/ / /_/ / /_/  __/   |
-                |  /____/\___/_/    |___/\___/_/      \____/ .___/\__,_/\__,_/\__/\___/    |
-                |                                         /_/                              |''').lstrip('\n')
-        output(banner)
-        output("+==========================================================================+")
-        output("\n[PaperMC Server Updater]")
-        output("[Handles the checking, downloading, and updating of server versions]")
-        output("[Written by: Owen Cochell and Creeper36]\n")
+    if not args.path or args.path.is_dir():
 
-    serv = ServerUpdater(args.path, config_file=args.config_file, config=args.no_load_config or args.server_version, prompt=args.interactive,
-                         version=args.iv, build=args.ib, integrity=args.no_integrity, user_agent=args.user_agent)
+        fatal(
 
-    update_available = True
+            EXIT_BAD_PATH,
+            "You must provide a .jar file when using --server-version.\n\n"
+            "     Info      : The updater expected a server JAR as the last argument.\n"
+            "     Fix       : Example: python server_update.py -sv C:\\minecraft\\paper.jar",
+            target=str(args.path) if args.path else None,
+            os_error=None
+
+        )   
+
+if not (args.batch):
+
+    output("\n+==========================================================================+")
+    banner = dedent(r'''
+            |     _____                              __  __          __      __        |
+            |    / ___/___  ______   _____  _____   / / / /___  ____/ /___ _/ /____    |
+            |    \__ \/ _ \/ ___/ | / / _ \/ ___/  / / / / __ \/ __  / __ `/ __/ _ \   |
+            |   ___/ /  __/ /   | |/ /  __/ /     / /_/ / /_/ / /_/ / /_/ / /_/  __/   |
+            |  /____/\___/_/    |___/\___/_/      \____/ .___/\__,_/\__,_/\__/\___/    |
+            |                                         /_/                              |''').lstrip('\n')
+    output(banner)
+    output("+==========================================================================+")
+    output("\n[PaperMC Server Updater]")
+    output("[Handles the checking, downloading, and updating of server versions]")
+    output("[Written by: Owen Cochell and Creeper36]\n")
+
+serv = ServerUpdater(args.path, config_file=args.config_file, config=args.no_load_config or args.server_version, prompt=args.interactive, version=args.iv, build=args.ib, integrity=args.no_integrity, user_agent=args.user_agent)
+
+update_available = True
 
 if args.check_only:
 
-    output("\n[ --== Checking For New Version: ==-- ]\n")
-
-    # Load version info using same logic as interactive
+    output("[ --== Checking For New Version: ==-- ]\n")
 
     local_version, local_build = serv.fileutil.load_config(serv.config_file)
-
-    # Show Local version info (stats-style block)
 
     output("\n+=================================================+")
     output("# Local Server Version Information:")
     output(f"  > Version: [{local_version}]")
     output(f"  > Build:   [{local_build}]")
     output("+=================================================+")
-
-    # Compare with remote builds
 
     try:
 
@@ -2285,17 +3052,15 @@ if args.check_only:
 
         error_report(e, net=isinstance(e, URLError))
 
-        sys.exit(0)
+        sys.exit(EXIT_NOTHING)
 
     if not remote_builds:
 
-        output(f"# ERROR: No builds found for version {local_version}")
+        output(f"No builds found for version {local_version}")
 
-        sys.exit(0)
+        sys.exit(EXIT_NOTHING)
 
     latest_remote_build = max(remote_builds)
-
-    # Show Remote version info (stats-style block)
 
     output("\n+=================================================+")
     output("# Remote Server Version Information:")
@@ -2309,84 +3074,189 @@ if args.check_only:
 
     else:
 
-        output(f"# New Version available! - [Version: {local_version}.{latest_remote_build}]")
+        output(f"# New Version Available! - [Version: {local_version}-{latest_remote_build}]")
 
-    output("\n[ --== Version check complete! ==-- ]\n")
+    output("\n[ --== Version Check Complete! ==-- ]")
 
-    sys.exit(0)
+    if args.check_only:
 
-# Determine if we should upgrade:
+                output("")
+
+    sys.exit(EXIT_NOTHING)
 
 if args.force_upgrade:
 
-    output("# Force upgrade enabled!")
+    output("# Force Script Upgrade! (forced: -F)\n")
 
 if args.upgrade or args.force_upgrade:
 
-    output("# Checking for script upgrade ...")
+    output("# Checking For Script Upgrade ...")
 
     upgrade_script(serv, force=args.force_upgrade)
 
-    sys.exit(0)
+    sys.exit(EXIT_NOTHING)
 
-# Start the server updater
+if args.server_version:
+
+    try:
+
+        try:
+
+            local_version, local_build = serv.fileutil.load_config(serv.config_file)
+
+        except Exception as e:
+
+            serv._url_report("Load Local Config")
+
+            error_report(e)
+
+            local_version, local_build = ("unknown", -1)
+
+        jar_path = None
+
+        base_dir = args.path if args.path.is_dir() else args.path.parent
+
+        if args.path.is_file() and args.path.suffix.lower() == ".jar":
+            jar_path = args.path
+
+        else:
+
+            jars = sorted((p for p in base_dir.glob("*.jar")),
+
+                          key=lambda p: p.stat().st_mtime,
+
+                          reverse=True)
+
+            paper_jars = [p for p in jars if p.name.lower().startswith("paper-")]
+
+            jar_path = paper_jars[0] if paper_jars else (jars[0] if jars else None)
+
+        if jar_path and jar_path.is_file():
+
+            try:
+
+                with open(jar_path, "rb") as f:
+
+                    local_sha = sha256(f.read()).hexdigest()
+
+                local_sha_line = f"  > SHA256:  [{local_sha}]"
+
+            except Exception as e:
+
+                error_report(e)
+
+                local_sha_line = "  > SHA256:  [Error reading file]"
+
+        else:
+
+            cfg_path = serv.fileutil.path / serv.fileutil.config_default
+
+            if cfg_path.is_file():
+
+                with open(cfg_path, "rb") as f:
+
+                    cfg_sha = sha256(f.read()).hexdigest()
+
+                local_sha_line = f"  > SHA256 (config):  [{cfg_sha}]"
+
+            else:
+
+                local_sha_line = "  > SHA256:  [Unavailable]"
+
+        output("\n+=============================================================================+")
+        output("# Local Server Version Information:")
+        output(f"  > Version: [{local_version}]")
+        output(f"  > Build:   [{local_build}]")
+        output(local_sha_line)
+        output("+=============================================================================+\n")
+
+        builds_for_status = serv.update.get_buildnums(local_version)
+
+        latest_build = max(builds_for_status) if builds_for_status else selected_build
+
+        meta = serv.update.build_download_url(local_version, latest_build)
+
+        remote_sha = (meta.get('checksums', {}) or {}).get('sha256', '').lower()
+
+        output("+=============================================================================+")
+        output("# Remote Server Version Information:")
+        output(f"  > Version: [{local_version}]")
+        output(f"  > Build:   [{latest_build}]")
+
+        if remote_sha:
+
+            output(f"  > SHA256:  [{remote_sha}]")
+
+        else:
+
+            output("  > SHA256:  [Unavailable]")
+
+        output("+=============================================================================+\n")
+
+        sys.exit(EXIT_NOTHING)
+
+    except Exception as e:
+
+        error_report(e, net=isinstance(e, URLError))
+
+        sys.exit(EXIT_NOTHING)
+
+if args.stats:
+
+    serv.view_data()
+
+    sys.exit(EXIT_NOTHING)
+
+if args.script_version:
+
+    output(f"\n+===============================================================+\n")
+    output(f"   PaperMC Updater Script - version: {__version__}\n")
+    output(f"   Contact GitHub: {GITHUB}")
+    output(f"   Current Python Version: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro} ({platform.system()})")
+    output(f"\n+===============================================================+\n")
+
+    sys.exit(EXIT_NOTHING)
 
 serv.start()
-
-# Figure out the output name:
 
 name = None
 
 if args.output:
 
-    # Name was explicitly given to us:
-
     name = args.output
 
 elif args.path.is_file():
 
-    # Get filename from the given path:
-
     name = args.path.name
-
-# Check if we are just looking for server info:
-
-if args.server_version:
-
-    # Already printed it, lets exit
-
-    sys.exit(0)
-
-# Check for displaying stats:
-
-if args.stats:
-
-    # Display stats to the terminal:
-
-    serv.view_data()
-
-    sys.exit(0)
-
-# Checking if we are skipping the update
 
 if not args.no_check and not args.new and not args.interactive:
 
-    # Allowed to check for update:
-
     update_available = serv.check(args.version, args.build)
-
-# Checking if we can download:
-
-if not args.check_only and update_available:
-
-    # Allowed to download/Can download
-
-    serv.get_new(default_version=args.version, default_build=args.build, backup=not (args.no_backup or args.new),
-                new=args.new, output_name=name, target_copy=args.copy_old)
-
-    sys.exit(1)
 
 else:
 
-    sys.exit(0)
+    if args.no_check:
 
+        output("\n# Skipping Version Check (forced: --no-check)")
+
+if not args.check_only and update_available:
+
+    if args.no_backup:
+
+        output("# Skipping Backup (forced: --no-backup)")
+
+    elif args.new:
+
+        output("\n# Skipping Backup (new install)")
+
+    res = serv.get_new(default_version=args.version, default_build=args.build,
+                       backup=not (args.no_backup or args.new),
+                       new=args.new, output_name=name, target_copy=args.copy_old)
+
+    if res:
+
+        sys.exit(EXIT_UPDATE)  # success: update installed
+
+    else:
+
+        sys.exit(EXIT_NOTHING)

@@ -777,7 +777,7 @@ def upgrade_script(serv: ServerUpdater, force: bool = False):
 
         if not args.batch:
 
-            output("\n[ --== Script Upgrade Complete! ==-- ]")
+            output("\n[ --== Script Upgrade Complete! ==-- ]\n\n")
 
         else:
 

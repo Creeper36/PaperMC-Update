@@ -1,5 +1,19 @@
 # Changelog 
 
+## 4.2.1c
+
+- Added automatic cleanup of stale .updating files and temporary directories
+
+- Enhanced load_config_new parser for flexible schema compatibility and accurate version/build extraction
+
+- Adjusted download progress handling for clearer and more consistent feedback
+
+- Unified exception handling to reduce duplicate error paths and improve reporting consistency
+
+- Standardized version string parsing to better handle edge cases and malformed configs
+
+- Improved script self-upgrade workflow with safer temporary file handling
+
 ## 4.2.0c
 
 - Introduced centralized EXIT_* system, covering all normal, error, and fatal exit codes (0–24).

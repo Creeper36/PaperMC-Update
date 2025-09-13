@@ -73,6 +73,7 @@
 
 ------------------------------------------------------------------------------------
 
+
 # PaperMC-Update
 
 A simple CLI script that can check, download, and install PaperMC jar files.

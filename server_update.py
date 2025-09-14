@@ -16,12 +16,12 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 """
 A tool to keep your Minecraft server up to date.
-It runs in automated batch or interactive modes, includes built-in SHA-256 integrity checks,
+It runs in automated or interactive modes, includes built-in SHA-256 integrity checks,
 provides robust backup/one-step rollback, and delivers clear,
 actionable error messages with suggested fixes for every error.
 """
 
-__version__ = '4.2.1c'
+__version__ = '4.2.2c'
 
 
 GITHUB = 'https://github.com/Creeper36/PaperMC-Update'
@@ -53,9 +53,6 @@ EXIT_NET_OFFLINE = 24      # Generic offline fallback (all network tests failed)
 def fatal(code: int, message: str = "", target: str = None, os_error: int = None) -> NoReturn:
     """
     Emit a standardized fatal error report and terminate immediately.
-    Captures exit code, human-readable context, and optional target path.
-    Includes raw OS errno details when provided for deep troubleshooting.
-    Guarantees clean process exit with the proper EXIT_* code.
     """
     output("\nx=======================================================================================x\n")
     output("             [ !! FATAL ERROR OCCURRED !! ]")
@@ -78,18 +75,13 @@ def fatal(code: int, message: str = "", target: str = None, os_error: int = None
 
 def error_report(exc, net: bool = False):
     """
-    Print raw traceback only. Provides developers with the exact Python error flow.
+    Print the raw exception traceback for python diagnostics.
     """
     a = globals().get("args")
-
     if a and getattr(a, "quiet", False):
-
         return
-
     traceback.print_exc()
-
     return
-
 
 if sys.version_info < (3, 7, 0):
     fatal(
@@ -114,7 +106,6 @@ filterArray = [
 quietmode = any(flag in sys.argv for flag in ("-q", "--quiet"))
 """
 Enable global quiet mode if -q/--quiet is present in sys.argv.
-Overrides builtins.print and stream writes to suppress all output.
 Ensures completely silent operation, including errors and fatals.
 Intended for automation where only exit codes are consumed.
 """
@@ -171,10 +162,10 @@ def _is_windows():
 
 def scavenge_stale(prefix: str = "pmcupd-"):
     """
-    Clean up stale updater artifacts:
-      1. Old TemporaryDirectory instances in the system temp folder.
-      2. Leftover '.updating' staging files in the server directory
-         (derived from args.path, falling back to script location).
+    Purge stale updater artifacts: temp dirs named with `prefix` in the OS temp 
+    and '*.updating' files in the server dir. Server dir is derived from 
+    args.path. Ignores all errors; never traverses outside those roots.
+    Args: prefix (str) — temp-dir name prefix to match; default "pmcupd-".
     """
 
     base = Path(tempfile.gettempdir())
@@ -474,25 +465,11 @@ def human_readable_size(n: int) -> str:
     return f"{f:.2f} {units[i]}"
 
 
-def load_local_version(serv: ServerUpdater) -> Tuple[str, int]:
-    """
-    Attempt to read the server’s local version_history.json metadata.
-    Delegates file handling to FileUtil for safety and normalization.
-    Returns (version, build) on success or ('unknown', -1) gracefully.
-    Provides a baseline before any remote API queries are made.
-    """
+def _latest_version(update: Update) -> Optional[str]:
 
-    try:
+    versions = update.get_versions()
 
-        version, build = serv.fileutil.load_config(serv.config_file)
-
-        return version, build
-
-    except Exception as e:
-
-        output(f"Error loading local version info: {e}")
-
-        return ("unknown", -1)
+    return max(versions, key=update.version_convert) if versions else None
 
 
 def load_config_old(config: dict) -> Tuple[str, int]:
@@ -702,6 +679,10 @@ def upgrade_script(serv: ServerUpdater, force: bool = False):
 
             )
 
+        if args.interactive:    
+
+            output("")
+
         output(f"# Remote File Found! -- SHA256 Ending in: {expected_sha[-10:]}")
 
         if not args.batch:
@@ -867,8 +848,6 @@ def progress_bar(length: int, stepsize: int, total_steps: int, step: int, prefix
 
     x = int(size*(step+1)/total_steps)
 
-    # Rendering progress bar:
-
     if args.quiet or args.batch:
 
         return
@@ -940,6 +919,15 @@ class Update:
         pass
 
 
+    def direct_download_url_v2(self, version: str, build_num: int, name: str) -> str:
+        """
+        Canonical v2 direct-download URL. Used as a stable fallback whenever
+        metadata lacks a fully-qualified download URL (e.g., v3 metadata without 'url').
+        """
+
+        return f"{self._base_v2}/versions/{version}/builds/{build_num}/downloads/{name}"
+
+
     def version_convert(self, ver: str) -> Tuple[int,int,int]:
         """
         Convert semantic-like versions into (major, minor, patch) ints.
@@ -1007,8 +995,6 @@ class Update:
         Always returns a live file-like object on success.
         """
 
-        import socket
-        
         req = urllib.request.Request(url, headers=self._headers)
 
         try:
@@ -1068,9 +1054,17 @@ class Update:
 
         name = str(ddata.get("name", ""))
 
-        expected_hash = str((ddata.get("checksums") or {}).get("sha256", ""))
+        url = ddata.get("url")
 
-        url = ddata.get("url") or f"{self.build_data_url(version, build_num)}/downloads/{name}"
+        if not url:
+
+            if not name:
+
+                name = f"paper-{version}-{build_num}.jar"
+
+            output("# No direct link in metadata; using v2 download URL fallback")
+
+            url = self.direct_download_url_v2(version, build_num, name)
 
         if path.is_dir():
 
@@ -1195,177 +1189,152 @@ class Update:
         return builds
 
 
-    def fetch_raw_api(self, version: Optional[str], build_num: Optional[int]) -> IO[bytes]:
+    def fetch_raw_api(self, version: str | None = None, build_num: int | None = None):
         """
         Attempt v3, then fall back to v2 with a single clear notice.
-        Classifies timeouts, HTTP, URL, and connection errors to EXIT_*.
-        Returns an open response stream upon first successful attempt.
+        Classifies timeouts, HTTP, URL, SSL, and connection errors to EXIT_*.
+        Returns an open response stream on first success.
         Updates self._base to the working endpoint for future calls.
         """
 
-        def try_request(base_url: str):
-
-            url = self.build_data_url(version, build_num).replace(self._base, base_url)
-
-            req = urllib.request.Request(url, headers=self._headers)
-
-            return urllib.request.urlopen(req, timeout=5.0), url
-
         fallback_noted = False
 
-        for base in [self._base_v3, self._base_v2]:
+        for base in (self._base_v3, self._base_v2):
 
-            try:
+            max_tries = 2 if base == self._base_v2 else 1
 
-                resp, url = try_request(base)
+            for attempt in range(max_tries):
 
-                if base != self._base:
+                url = self.build_data_url(version, build_num).replace(self._base, base)
 
-                    self._base = base
+                req = urllib.request.Request(url, headers=self._headers)
 
-                return resp
+                try:
 
-            except (TimeoutError, socket.timeout):
+                    resp = urllib.request.urlopen(req, timeout=10.0)
 
-                if base == self._base_v3:
+                    if base != self._base:
 
-                    if not fallback_noted:
+                        self._base = base
 
-                        output("# V3 API Failed.. Attempting Fallback to V2 API ..... ")
+                    return resp
 
-                        fallback_noted = True
+                except (TimeoutError, socket.timeout):
 
-                    continue
+                    if base == self._base_v3:
 
-                fatal(
+                        if not fallback_noted:
 
-                    EXIT_NET_TIMEOUT,
-                    "Network timeout during URL fetch.\n\n"
-                    "     Info      : The server did not respond in the expected timeframe.\n"
-                    "     Info      : This usually indicates temporary connectivity issues.\n"
-                    "     Fix       : Check your internet connection.\n"
-                    "     Fix       : Retry after a few minutes.",
-                    target=base, os_error=None
+                            output("# V3 API Failed.. Attempting Fallback to V2 API ..... ")
+                            fallback_noted = True
 
-                )
-            
-            except HTTPError as e:
+                        break
 
-                if base == self._base_v3:
+                    if attempt + 1 < max_tries:
 
-                    if not fallback_noted:
+                        time.sleep(0.5); continue
 
-                        output("# V3 API Failed.. Attempting Fallback to V2 API ..... ")
+                    fatal(EXIT_NET_TIMEOUT,
+                          "Network timeout during URL fetch.\n\n"
+                          "     Info      : The server did not respond in the expected timeframe.\n"
+                          "     Fix       : Check your internet connection.\n"
+                          "     Fix       : Retry after a few minutes.",
+                          target=url, os_error=None)
 
-                        fallback_noted = True
+                except HTTPError as e:
 
-                    continue  # try v2
+                    if base == self._base_v3:
 
-                fatal(
+                        if not fallback_noted:
 
-                    EXIT_NET_DL,
-                    "Connection error during URL fetch.\n\n"
-                    "     Info      : The updater attempted to connect but the connection failed.\n"
-                    "     Info      : Causes may include firewalls, DNS issues, or server downtime.\n"
-                    "     Fix       : Verify papermc.io is reachable from your network.\n"
-                    "     Fix       : Retry later or check firewall rules.",
-                    target=base, os_error=_errno(e)
+                            output("# V3 API Failed.. Attempting Fallback to V2 API ..... ")
 
-                )
+                            fallback_noted = True
 
-            except ssl.SSLError as e:
+                        break
 
-                fatal(
+                    if attempt + 1 < max_tries:
 
-                    EXIT_NET_SSL,
-                    "SSL error during URL fetch.\n\n"
-                    "     Info      : A problem occurred during SSL handshake or certificate validation.\n"
-                    "     Info      : This may be due to an invalid certificate or outdated system CA.\n"
-                    "     Fix       : Check your system clock and ensure certificates are up-to-date.\n"
-                    "     Fix       : Retry with a stable network or updated Python/OS.",
-                    target=base, os_error=None
+                        time.sleep(0.5); continue
 
-                )
+                    fatal(EXIT_NET_DL,
+                          "Connection error during URL fetch.\n\n"
+                          "     Info      : Upstream returned an error status code.\n"
+                          "     Fix       : Retry later; if persistent, check PaperMC status.",
+                          target=url, os_error=_errno(e))
 
-            except URLError as e:
+                except ssl.SSLError as e:
 
-                reason = getattr(e, "reason", None)
+                    if base == self._base_v3:
 
-                eno = _errno(reason) if isinstance(reason, OSError) else _errno(e)
+                        if not fallback_noted:
 
-                if eno in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+                            output("# V3 API Failed.. Attempting Fallback to V2 API ..... ")
 
-                    fatal(
+                            fallback_noted = True
 
-                        EXIT_NET_UNREACH,
-                        "Network unreachable during URL fetch.\n\n"
-                        "     Info      : The updater could not reach the target network.\n"
-                        "     Info      : This can happen if your router, DNS, or ISP is blocking access.\n"
-                        "     Fix       : Verify your internet settings.\n"
-                        "     Fix       : Try again after reconnecting to the network.",
-                        target=base, os_error=eno
+                        break
 
-                    )
+                    fatal(EXIT_NET_SSL,
+                          "SSL error during URL fetch.\n\n"
+                          "     Info      : SSL handshake/certificate problem.\n"
+                          "     Fix       : Check system clock and CA store.",
+                          target=url, os_error=_errno(e))
 
-                if base == self._base_v3:
+                except URLError as e:
 
-                    if not fallback_noted:
+                    if base == self._base_v3:
 
-                        output("# V3 API Failed.. Attempting Fallback to V2 API ..... ")
+                        if not fallback_noted:
 
-                        fallback_noted = True
+                            output("# V3 API Failed.. Attempting Fallback to V2 API ..... ")
 
-                    continue
+                            fallback_noted = True
 
-                fatal(
+                        break
+                    if attempt + 1 < max_tries:
 
-                    EXIT_NET_URL,
-                    "URL error during URL fetch.\n\n"
-                    "     Info      : The provided URL was invalid or inaccessible.\n"
-                    "     Info      : A malformed URL or DNS failure may be the cause.\n"
-                    "     Fix       : Verify the target URL in your config.\n"
-                    "     Fix       : Retry after correcting the URL.",
-                    target=base, os_error=eno
+                        time.sleep(0.5); continue
 
-                )
+                    fatal(EXIT_NET_URL,
+                          "URL error during URL fetch.\n\n"
+                          "     Info      : Invalid/inaccessible URL, DNS, or proxy issue.\n"
+                          "     Fix       : Verify DNS and proxy settings.",
+                          target=url, os_error=_errno(getattr(e, 'reason', e)))
 
-            except ConnectionError as e:
+                except ConnectionError as e:
 
-                if base == self._base_v3:
+                    if base == self._base_v3:
 
-                    if not fallback_noted:
+                        if not fallback_noted:
 
-                        output("# V3 API Failed.. Attempting Fallback to V2 API ..... ")
+                            output("# V3 API Failed.. Attempting Fallback to V2 API ..... ")
 
-                        fallback_noted = True
+                            fallback_noted = True
 
-                    continue
+                        break
 
-                error_report(e, net=True)
+                    if attempt + 1 < max_tries:
 
-                fatal(
+                        time.sleep(0.5); continue
 
-                    EXIT_NET_DL,
-                    "Connection error during URL fetch.\n\n"
-                    "     Info      : The updater attempted to connect but the connection failed.\n"
-                    "     Info      : Causes may include firewalls, DNS issues, or server downtime.\n"
-                    "     Fix       : Verify papermc.io is reachable from your network.\n"
-                    "     Fix       : Retry later or check firewall rules.",
-                    target=base, os_error=_errno(e)
+                    error_report(e, net=True)
 
-                )
+                    fatal(EXIT_NET_DL,
+                          "Connection error during URL fetch.\n\n"
+                          "     Info      : The updater attempted to connect but the connection failed.\n"
+                          "     Info      : Causes may include firewalls, DNS issues, or server downtime.\n"
+                          "     Fix       : Verify papermc.io is reachable from your network.\n"
+                          "     Fix       : Retry later or check firewall rules.",
+                          target=url, os_error=_errno(e))
 
-        fatal(
-
-            EXIT_NET_DL,
-            "Both v3 and v2 API requests failed.\n\n"
-            "     Info      : The updater attempted to query both PaperMC v3 and v2 APIs, but both calls failed.\n"
-            "     Info      : This usually indicates a PaperMC server outage or severe connectivity problem.\n"
-            "     Fix       : Check https://papermc.io/ for current status.\n"
-            "     Fix       : Retry later once the API is available again.",
-            target=f"{self._base} and {self._base_v2}", os_error=None
-
-        )
+        fatal(EXIT_NET_DL,
+              "Both v3 and v2 API requests failed.\n\n"
+              "     Info      : The updater attempted to query both PaperMC v3 and v2 APIs, but both calls failed.\n"
+              "     Info      : This usually indicates a PaperMC server outage or severe connectivity problem.\n"
+              "     Fix       : Check https://papermc.io/ for current status.\n"
+              "     Fix       : Retry later once the API is available again.",
+              target=f"{self._base_v3} and {self._base_v2}", os_error=None)
 
 
     def decode_json_metadata(self, version: Optional[str] = None, build_num: Optional[int] = None) -> Dict[str, Any]:
@@ -2218,14 +2187,16 @@ class ServerUpdater:
 
     def view_data(self):
         """
-        Present a diagnostic snapshot: local config vs remote artifact.
-        Includes API base, latency, size, SHA256, commits, and paths.
-        Performs disk-space checks and local JAR introspection.
-        Designed for --stats to preflight before any install action.
+        Present a diagnostic snapshot with correct newest-version semantics:
+        - Determine newest MC version via _latest_version(self.update)
+        - If local build is invalid, choose max build for the chosen target version
+        - Fetch metadata for that target version/build
+        - Compute status against the newest version/build (not just local)
+        Designed for --stats.
         """
 
         def out_i(level: int, text: str = "", _BASE: int = 3, _UNIT: int = 4):
-        
+
             output((" " * (_BASE + _UNIT * level)) + text)
 
         def section(title: str):
@@ -2256,21 +2227,11 @@ class ServerUpdater:
 
         out_i(1, f"Config:  {cfg_guess}")
 
-        api_base = None
+        api_base = remote_name = remote_sha = None
 
-        remote_name = None
-
-        remote_sha  = None
-
-        remote_size = None
-
-        remote_time = None
-
-        selected_build = local_build
+        remote_size = remote_time = None
 
         commits = []
-
-        newer_version_line = "none"
 
         latency_ms = None
 
@@ -2278,25 +2239,41 @@ class ServerUpdater:
 
             versions = self.update.get_versions()
 
-            if local_version in ("unknown", "0") and versions:
+        except Exception:
 
-                local_version = versions[-1]  # fallback to newest if unknown, just to proceed
+            versions = []
 
-            newest_ver = versions[-1] if versions else None
+        newest_ver = _latest_version(self.update) if versions else None
 
-            if newest_ver and newest_ver != local_version:
+        if newest_ver and local_version not in ("unknown", "0") and newest_ver != local_version:
 
-                newer_version_line = f"{newest_ver} (you are on {local_version})"
+            newer_version_line = f"{newest_ver} (you are on {local_version})"
 
-            if not isinstance(local_build, int) or local_build <= 0:
+        elif newest_ver and local_version in ("unknown", "0"):
 
-                builds = self.update.get_buildnums(local_version)
+            newer_version_line = f"{newest_ver} (local unknown)"
 
-                selected_build = max(builds) if builds else -1
+        else:
+
+            newer_version_line = "none"
+
+        target_ver = newest_ver or local_version
+
+        try:
+
+            builds_for_target = self.update.get_buildnums(target_ver)
+
+            if isinstance(local_build, int) and local_build > 0 and local_build in builds_for_target:
+
+                selected_build = local_build
+
+            else:
+
+                selected_build = max(builds_for_target) if builds_for_target else -1            
 
             t0 = time.perf_counter()
 
-            data = self.update.decode_json_metadata(local_version, selected_build)
+            data = self.update.decode_json_metadata(target_ver, selected_build)
 
             latency_ms = int((time.perf_counter() - t0) * 1000)
 
@@ -2310,25 +2287,27 @@ class ServerUpdater:
 
             remote_sha  = (dflt.get("checksums") or {}).get("sha256")
 
-            remote_size = int(dflt.get("size") or 0)        
+            remote_size = int(dflt.get("size") or 0)
 
             remote_time = data.get('time', 'unknown')
 
             commits = data.get("commits") or data.get("changes", []) or []
 
-            builds_for_status = self.update.get_buildnums(local_version)
+            builds_for_status = self.update.get_buildnums(target_ver)
 
             latest_build = max(builds_for_status) if builds_for_status else selected_build
 
-            if isinstance(local_build, int) and local_build >= latest_build:
+            same_mc = (self.update.version_convert(local_version) ==
+
+                       self.update.version_convert(target_ver))
+
+            if same_mc and isinstance(local_build, int) and local_build >= latest_build:
 
                 status_line = "UP-TO-DATE"
 
             else:
 
-                behind = (latest_build - (local_build if isinstance(local_build, int) else 0)) if (isinstance(latest_build, int) and isinstance(local_build, int) and local_build > 0) else "unknown"
-
-                status_line = f"BEHIND (latest build: {latest_build}, behind by {behind})"
+                status_line = f"BEHIND (latest on {target_ver}: {latest_build})"
 
             section("\nUpdate Status")
 
@@ -2346,7 +2325,7 @@ class ServerUpdater:
 
             latest_tag = " (latest)" if (selected_build != local_build and selected_build != -1 and selected_build == latest_build) else ""
 
-            out_i(1, f"Version/Build: {local_version} / {selected_build}{latest_tag}")
+            out_i(1, f"Version/Build: {target_ver} / {selected_build}{latest_tag}")
 
             out_i(1, f"File: {remote_name}")
 
@@ -2358,21 +2337,13 @@ class ServerUpdater:
 
             if commits:
 
-                section("\nRecent Commits (top 5)")
+                section("\nRecent Changes")
 
-                for i, c in enumerate(commits[:5], 1):
+                for c in commits[:10]:
 
-                    sha7 = c.get("sha") or c.get("commit", "")
+                    msg = (c.get("message") or c.get("summary") or str(c)).strip().splitlines()[0]
 
-                    sha7 = sha7[:7]
-
-                    ctime = c.get("time", "?")
-
-                    summary = c.get("summary") or c.get("message", "")
-
-                    msg = (summary or "").strip().splitlines()[0]
-
-                    out_i(1, f"{i}) {sha7}  {ctime}  {msg}")
+                    out_i(1, f"- {msg}")
 
         except Exception as e:
 
@@ -2560,9 +2531,7 @@ class ServerUpdater:
 
                     pass
 
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-            s.settimeout(5.0)
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(5.0)
 
             try:
 
@@ -2938,7 +2907,6 @@ class ServerUpdater:
 
             )
 
-
         except Exception as e:
 
             self._url_report("File Download")
@@ -3108,7 +3076,7 @@ class ServerUpdater:
 
                 if print_output:
 
-                    output(f"\n# Selecting latest {name} - [{latest}] ...")
+                    output(f"# Selecting latest {name} - [{latest}] ...")
 
                 return latest
 
@@ -3241,6 +3209,7 @@ if args.stats or args.check_only or getattr(args, "server_version", False):
     if p is not None and not Path(p).expanduser().exists():
 
         fatal(
+
             EXIT_BAD_PATH,
             "Operator supplied a path that does not exist for this read-only command.\n"
             "     Info : For --stats/--check-only/--server-version we do not auto-resolve.\n"
@@ -3282,8 +3251,6 @@ if not (args.batch):
 
 serv = ServerUpdater(args.path, config_file=args.config_file, config=(not args.no_load_config), prompt=args.interactive, version=args.iv, build=args.ib, integrity=args.no_integrity, user_agent=args.user_agent)
 
-update_available = True
-
 if args.check_only:
 
     output("\n[ --== Checking For New Version: ==-- ]\n")
@@ -3296,9 +3263,11 @@ if args.check_only:
     output(f"  > Build:   [{local_build}]")
     output("+=================================================+")
 
+    mc_latest = _latest_version(serv.update) or local_version
+
     try:
 
-        remote_builds = serv.update.get_buildnums(local_version)
+        remote_builds = serv.update.get_buildnums(mc_latest)
 
     except Exception as e:
 
@@ -3308,7 +3277,7 @@ if args.check_only:
 
     if not remote_builds:
 
-        output(f"No builds found for version {local_version}")
+        output(f"No builds found for version {mc_latest}")
 
         sys.exit(EXIT_NOTHING)
 
@@ -3316,23 +3285,28 @@ if args.check_only:
 
     output("\n+=================================================+")
     output("# Remote Server Version Information:")
-    output(f"  > Version: [{local_version}]")
+    output(f"  > Version: [{mc_latest}]")
     output(f"  > Build:   [{latest_remote_build}]")
     output("+=================================================+\n")
 
-    if local_build >= latest_remote_build:
+    same_mc = (local_version not in ("unknown", "0") and
+               serv.update.version_convert(local_version) == serv.update.version_convert(mc_latest))
+
+    if same_mc and isinstance(local_build, int) and local_build >= latest_remote_build:
 
         output("# You are up to date!")
 
     else:
 
-        output(f"# New Version Available! - [Version: {local_version}-{latest_remote_build}]")
+        if same_mc:
 
-    output("\n[ --== Version Check Complete! ==-- ]")
+            output(f"# New Version Available! - [Version: {mc_latest}-{latest_remote_build}]\n")
 
-    if args.check_only:
+        else:
 
-                output("")   # Keep for spacing alignment
+            output(f"# Newer game version available: {mc_latest} (you are on {local_version})\n")
+
+    output("")
 
     sys.exit(EXIT_NOTHING)
 
@@ -3369,6 +3343,7 @@ if args.server_version:
         base_dir = args.path if args.path.is_dir() else args.path.parent
 
         if args.path.is_file() and args.path.suffix.lower() == ".jar":
+
             jar_path = args.path
 
         else:
@@ -3422,36 +3397,30 @@ if args.server_version:
         output(local_sha_line)
         output("+=============================================================================+\n")
 
-        builds_for_status = serv.update.get_buildnums(local_version)
+        mc_latest = _latest_version(serv.update) or local_version
+
+        builds_for_status = serv.update.get_buildnums(mc_latest)
 
         latest_build = max(builds_for_status) if builds_for_status else selected_build
 
-        meta = serv.update.build_download_url(local_version, latest_build)
+        meta = serv.update.build_download_url(mc_latest, latest_build)
 
         remote_sha = (meta.get('checksums', {}) or {}).get('sha256', '').lower()
 
         output("+=============================================================================+")
         output("# Remote Server Version Information:")
-        output(f"  > Version: [{local_version}]")
+        output(f"  > Version: [{mc_latest}]")
         output(f"  > Build:   [{latest_build}]")
-
-        if remote_sha:
-
-            output(f"  > SHA256:  [{remote_sha}]")
-
-        else:
-
-            output("  > SHA256:  [Unavailable]")
-
+        output(f"  > SHA256:  [{remote_sha or 'Unavailable'}]")
         output("+=============================================================================+\n")
 
         sys.exit(EXIT_NOTHING)
 
     except Exception as e:
 
-        error_report(e, net=isinstance(e, URLError))
+        error_report(e)
 
-        sys.exit(EXIT_NOTHING)
+        sys.exit(EXIT_OTHER)
 
 if args.stats:
 
@@ -3473,6 +3442,8 @@ serv.start()
 
 name = None
 
+update_available = True
+
 if args.output:
 
     name = args.output
@@ -3485,29 +3456,25 @@ if not args.no_check and not args.new and not args.interactive:
 
     update_available = serv.check(args.version, args.build)
 
-else:
+elif args.no_check:
 
-    if args.no_check:
-
-        output("\n# Skipping Version Check (forced: --no-check)")
+    output("\n# Skipping Version Check (forced: --no-check)")
 
 if not args.check_only and update_available:
 
     if args.no_backup:
 
-        output("# Skipping Backup (forced: --no-backup)")
+        output("\n# Skipping Backup (forced: --no-backup)")
 
     elif args.new:
 
         output("\n# Skipping Backup (new install)")
 
-    res = serv.get_new(default_version=args.version, default_build=args.build,
-                       backup=not (args.no_backup or args.new),
-                       new=args.new, output_name=name, target_copy=args.copy_old)
+    res = serv.get_new(default_version=args.version, default_build=args.build, backup=not (args.no_backup or args.new), new=args.new, output_name=name, target_copy=args.copy_old)
 
     if res:
 
-        sys.exit(EXIT_UPDATE)  # success: update installed
+        sys.exit(EXIT_UPDATE)
 
     else:
 

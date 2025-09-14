@@ -1,5 +1,29 @@
 # Changelog 
 
+## 4.2.2c
+
+- Automatic v2 direct-download fallback when v3 metadata lacks a URL (builds canonical v2 link).
+
+- Build selection scoped to the chosen MC version to prevent cross-version build mixups (e.g., 1.21.8 → 60).
+
+- Plugins Snapshot panel in --stats (plugin count and names when present).
+
+- Environment panel in --stats (OS, Python, HTTP UA, Java, and local 25565 port check).
+
+- --stats tags the latest build as "(latest)" in the Version/Build line.
+
+- Recent Changes preview in --stats (first changelog entry for the selected artifact).
+
+- Removed an unused variable and inner imports in the download path.
+
+- Reject non-existent paths for read-only commands (--stats, --check-only, --server-version) with EXIT_BAD_PATH.
+
+- Centralized v2 URL construction into a helper to avoid composing invalid v3 download paths.
+
+- Stale updater cleanup on startup/exit (temp dirs with prefix and '*.updating' files in server dir).
+
+- Concise docstrings for scavenge_stale and error_report.
+
 ## 4.2.1c
 
 - Added automatic cleanup of stale .updating files and temporary directories

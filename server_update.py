@@ -528,23 +528,48 @@ def load_config_new(config: dict) -> Tuple[str, int]:
 
         s = ver_str.strip()
 
-        m = re.search(r'(?i)(\d+(?:\.\d+){0,2})-(\d+)(?:-[0-9a-f]{5,40})?(?:\s*\(MC:\s*(\d+(?:\.\d+){0,2})\s*\))?', s)
+        # Paper 26.x may write strings like:
+        #   26.2-rc-2-5
+        #   26.2-rc-2-5-d1aca9a
+        # where the final numeric segment is the Paper build and the earlier
+        # portion is the Minecraft/Paper version. Older parsing grabbed "2-5"
+        # from the tail and incorrectly reported local version "2".
+        m_new = re.search(
+            r'(?i)^([0-9]+(?:\.[0-9]+)*(?:-(?:rc|pre|alpha|beta)-[0-9]+)?)-([0-9]+)(?:-[0-9a-f]{5,40})?(?:\s*\(MC:\s*([^\)]+)\s*\))?$',
+            s
+        )
 
-        if m:
+        if m_new:
 
-            mc_from_left = m.group(1)
+            derived_mc = (m_new.group(3) or m_new.group(1)).strip()
 
-            mc_from_paren = m.group(3)  # may be None
-
-            derived_mc = (mc_from_paren or mc_from_left)
-
-            derived_build = int(m.group(2))
+            derived_build = int(m_new.group(2))
 
             ver_str = derived_mc
 
             if build is None:
 
                 build = derived_build
+
+        else:
+
+            m = re.search(r'(?i)(\d+(?:\.\d+){0,2})-(\d+)(?:-[0-9a-f]{5,40})?(?:\s*\(MC:\s*(\d+(?:\.\d+){0,2})\s*\))?', s)
+
+            if m:
+
+                mc_from_left = m.group(1)
+
+                mc_from_paren = m.group(3)  # may be None
+
+                derived_mc = (mc_from_paren or mc_from_left)
+
+                derived_build = int(m.group(2))
+
+                ver_str = derived_mc
+
+                if build is None:
+
+                    build = derived_build
 
     if isinstance(build, str):
 
@@ -1292,6 +1317,7 @@ class Update:
                             fallback_noted = True
 
                         break
+
                     if attempt + 1 < max_tries:
 
                         time.sleep(0.5); continue
